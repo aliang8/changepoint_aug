@@ -15,6 +15,7 @@ from imitation.data import serialize
 import numpy as np
 import tqdm
 import imageio
+from scipy import ndimage
 import matplotlib.pyplot as plt
 from env_utils import create_single_env
 
@@ -47,14 +48,22 @@ def main(
 
         for indx, traj in enumerate(trajs):
             env.reset()
+            infos = traj.infos
+
+            env._freeze_rand_vec = True
+            env._last_rand_vec = infos[0]["last_rand_vec"]
+            env._target_pos = infos[0]["task"]
+            env.reset_model()
+
             images = []
 
-            print(indx, len(traj.infos))
-            for ts in range(len(traj.infos)):
-                qpos = traj.infos[ts]["qpos"]
-                qvel = traj.infos[ts]["qvel"]
+            print(indx, len(infos))
+            for ts in range(len(infos)):
+                qpos = infos[ts]["qpos"]
+                qvel = infos[ts]["qvel"]
                 env.set_env_state((qpos, qvel))
                 img = env.render()
+                img = ndimage.rotate(img, 180)
                 images.append(img)
 
             # save images to file

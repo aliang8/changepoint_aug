@@ -8,7 +8,7 @@ Sample usage:
         --num_cps 50 \
         --num_augmentations_per_cp 1 \
         --num_expert_steps 20 \
-        --num_pertubation_steps 1
+        --num_pertubation_steps 0
 """
 
 import os
@@ -66,6 +66,8 @@ def main(
             # sample a changepoint timestep
             found_cp = False
             timestep = -1
+
+            # heuristic-based changepoint detection
             for timestep in range(n_timesteps):
                 if (
                     expert_trajectories[rollout_indx].infos[timestep]["in_place_reward"]
@@ -73,18 +75,37 @@ def main(
                 ):
                     found_cp = True
                     break
+        elif aug_type == "td":
+            pass
+        elif aug_type == "copycat":
+            pass
+        elif aug_type == "influence":
+            pass
 
-        obs, _ = env.reset()
+        info = expert_trajectories[rollout_indx].infos
+
         for _ in range(num_augmentations_per_cp):
+            obs, _ = env.reset()
             # reset env to a randomly sampled state
-            qpos = expert_trajectories[rollout_indx].infos[timestep]["qpos"]
-            qvel = expert_trajectories[rollout_indx].infos[timestep]["qvel"]
+            qpos = info[timestep]["qpos"]
+            qvel = info[timestep]["qvel"]
+
+            # also need to reset the task
+            # first freeze the env
+            env._freeze_rand_vec = True
+            env._last_rand_vec = info[0]["last_rand_vec"]
+            env._target_pos = info[0]["task"]
+            env.reset_model()
             env.set_env_state((qpos, qvel))
 
             # perturb by taking some random actions
             for _ in range(num_pertubation_steps):
-                obs, _, _, _, _ = env.step(env.action_space.sample())
+                rand_action = env.action_space.sample()
+                # don't open the gripper
+                rand_action[-1] = 0
+                obs, _, _, _, _ = env.step(rand_action)
 
+            obs = env._get_obs()
             obss = [obs]
             acts = []
             infos = []
@@ -95,6 +116,14 @@ def main(
                 # action, _ = expert_policy.predict(obs)
                 action = expert_policy.get_action(obs)
                 obs, rew, _, _, info = env.step(action)
+
+                # add env info
+                if "metaworld" in env_name.lower():
+                    info["qpos"] = env.get_env_state()[0]
+                    info["qvel"] = env.get_env_state()[1]
+                    info["task"] = env._target_pos
+                    info["last_rand_vec"] = env._last_rand_vec
+
                 obss.append(obs)
                 acts.append(action)
                 rews.append(rew)
@@ -117,6 +146,7 @@ def main(
         / env_name
         / f"aug_{aug_type}_{num_expert_steps}"
     )
+    print("saving to ", output_dir)
     serialize.save(output_dir, augmentations)
 
 

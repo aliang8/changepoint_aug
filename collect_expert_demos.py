@@ -37,12 +37,12 @@ for indx in range(num_episodes):
     infos = []
     dones = []
 
-    # while count < 500 and not done:
-    while count < 500:
+    while count < 500 and not done:
+        # while count < 500:
         action = p.get_action(obs)
         next_obs, reward, _, truncated, info = env.step(action)
         if int(info["success"]) == 1:
-            print(indx, " success")
+            # print(indx, " success")
             done = True
 
         obs = next_obs
@@ -57,6 +57,8 @@ for indx in range(num_episodes):
         if "metaworld" in env_name.lower():
             info["qpos"] = env.get_env_state()[0]
             info["qvel"] = env.get_env_state()[1]
+            info["task"] = env._target_pos
+            info["last_rand_vec"] = env._last_rand_vec
         infos.append(info)
 
     trajectory = TrajectoryWithRew(

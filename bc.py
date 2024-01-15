@@ -5,6 +5,7 @@ python3 bc.py \
     --num_bc_epochs 100 \
     --mode train \
     --root_dir /scr/aliang80/changepoint_aug \
+    --seed 0 \
     --augmentation_dataset_file  \
 """
 
@@ -164,14 +165,20 @@ def main(
 
     # save the trained policy
     if mode == "train":
-        ckpt_path = (
+        # write these eval stats to file
+        ckpt_dir = (
             Path(root_dir)
             / "bc_policies"
             / env_name
             / f"demos_{num_demos}"
             / f"e_{num_bc_epochs}"
-            / f"s_{seed}.zip"
         )
+        eval_file = ckpt_dir / f"eval_s_{seed}.txt"
+
+        with open(eval_file, "w") as f:
+            f.write(f"rew: {mean_reward}, std: {std_reward}, sr: {sr}")
+
+        ckpt_path = ckpt_dir / f"s_{seed}.zip"
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         print("Saving the trained policy to ", ckpt_path)
         save_policy(policy, ckpt_path)
