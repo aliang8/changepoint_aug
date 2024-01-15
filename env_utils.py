@@ -5,6 +5,9 @@ import numpy as np
 import imageio
 import gymnasium as gym
 import metaworld
+from scipy import ndimage
+from pathlib import *
+import shutil
 
 
 class PixelObservationWrapper(gym.Wrapper):
@@ -129,18 +132,30 @@ def run_eval_rollouts(
     policy,
     visualize: bool = False,
     video_dir: str = None,
+    seed: int = 0,
+    image_based: bool = False,
 ):
     # note, this is mainly for visualization, to generate eval use the
     # code from imitation library: https://imitation.readthedocs.io/en/latest/main-concepts/trajectories.html
     episode_returns = []
 
-    env = create_single_env(env_name)
+    env = create_single_env(env_name, seed, image_based)
+
+    # first delete video_dir if it exists
+    if video_dir is not None:
+        video_dir = Path(video_dir)
+        if video_dir.exists():
+            shutil.rmtree(video_dir)
+
+    video_dir.mkdir(parents=True, exist_ok=True)
 
     for rollout_idx in tqdm.tqdm(range(num_episodes)):
         frames = []
         states = None  # initial state
         obs, _ = env.reset()
         episode_return = 0
+
+        success = False
 
         for t in range(episode_length):
             actions, states = policy.predict(
@@ -150,8 +165,13 @@ def run_eval_rollouts(
             )
             next_obs, rewards, dones, truncated, infos = env.step(actions)
 
+            if infos["success"]:
+                success = True
+
             if visualize:
                 frame = env.render()
+                # flip this
+                frame = ndimage.rotate(frame, 180)
 
                 if "metaworld" in env_name.lower():
                     # this is for Metaworld, add some text for debugging
@@ -168,11 +188,15 @@ def run_eval_rollouts(
                     )
 
                 frames.append(frame)
+
             obs = next_obs
             episode_return += rewards
 
         episode_returns.append(episode_return)
 
         if video_dir is not None:
-            vid_path = os.path.join(video_dir, f"rollout_{rollout_idx}.mp4")
+            vid_path = os.path.join(
+                video_dir,
+                f"rollout_{rollout_idx}_{round(episode_return, 2)}_{success}.mp4",
+            )
             imageio.mimsave(vid_path, frames)

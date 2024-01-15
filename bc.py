@@ -4,7 +4,7 @@ CUDA_VISIBLE_DEVICES=5 python3 bc.py \
     --num_demos 25 \
     --num_bc_epochs 100 \
     --mode train \
-    --n_eval_episodes 1 \
+    --n_eval_episodes 5 \
     --root_dir /scr/aliang80/changepoint_aug \
     --dataset_file datasets/expert_dataset/image_True/assembly-v2_100 \
     --seed 0 \
@@ -183,6 +183,7 @@ def main(
         bc_trainer.train(
             n_epochs=num_bc_epochs,
             progress_bar=True,
+            log_interval=1000,  # number of batches between eval
             log_rollouts_n_episodes=n_eval_episodes,
             log_rollouts_venv=evaluation_env,
         )
@@ -207,7 +208,7 @@ def main(
             / f"e_{num_bc_epochs}"
             / f"image_{image_based}"
         )
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
         eval_file = ckpt_dir / f"eval_s_{seed}.txt"
 
         with open(eval_file, "w") as f:
