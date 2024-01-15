@@ -1,11 +1,14 @@
 """
-python3 bc.py \
+CUDA_VISIBLE_DEVICES=5 python3 bc.py \
     --env_name metaworld-assembly-v2 \
     --num_demos 25 \
     --num_bc_epochs 100 \
     --mode train \
+    --n_eval_episodes 1 \
     --root_dir /scr/aliang80/changepoint_aug \
+    --dataset_file datasets/expert_dataset/image_True/assembly-v2_100 \
     --seed 0 \
+    --image_based True \
     --augmentation_dataset_file  \
 """
 
@@ -35,16 +38,27 @@ import imitation.data.rollout as rollout
 from imitation.algorithms import bc
 from imitation.data.wrappers import RolloutInfoWrapper
 
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.torch_layers import MlpExtractor
+import stable_baselines3 as sb3
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.policies import ActorCriticPolicy, ActorCriticCnnPolicy
 
 
 # Custom MLP policy of three layers of size 128 each
-class CustomPolicy(ActorCriticPolicy):
+class CustomMLPPolicy(ActorCriticPolicy):
     def __init__(self, *args, **kwargs):
-        super(CustomPolicy, self).__init__(
+        super(CustomMLPPolicy, self).__init__(
             *args, **kwargs, net_arch=[dict(pi=[128, 128, 128], vf=[128, 128, 128])]
+        )
+
+
+class CustomCNNPolicy(ActorCriticCnnPolicy):
+    def __init__(self, *args, **kwargs):
+        super(CustomCNNPolicy, self).__init__(
+            *args,
+            **kwargs,
+            share_features_extractor=True,
+            normalize_images=True,
+            net_arch=[dict(pi=[128, 128, 128], vf=[128, 128, 128])],
         )
 
 
@@ -60,6 +74,7 @@ class CustomPolicy(ActorCriticPolicy):
 @click.option("--mode", default="train")
 @click.option("--aug_type", default="random")
 @click.option("--seed", default=0)
+@click.option("--image_based", default=False)
 @click.option("--augmentation_dataset_file", default=None)
 def main(
     env_name: str,
@@ -73,16 +88,25 @@ def main(
     mode: str,
     aug_type: str,
     seed: int,
+    image_based: bool,
     augmentation_dataset_file: str = None,
 ):
     def _make_env():
-        env = create_single_env(env_name, seed)
+        env = create_single_env(env_name, seed, image_based=image_based)
         env = RolloutInfoWrapper(env)
         return env
 
+    print("number of devices: ", torch.cuda.device_count())
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = DummyVecEnv([_make_env for _ in range(n_eval_episodes)])
-    evaluation_env = DummyVecEnv([_make_env for _ in range(n_eval_episodes)])
+    evaluation_env = SubprocVecEnv([_make_env for _ in range(n_eval_episodes)])
+    if image_based:
+        # convert image observations to be CxHxW
+        # env = sb3.common.vec_env.vec_transpose.VecTransposeImage(env)
+        evaluation_env = sb3.common.vec_env.vec_transpose.VecTransposeImage(
+            evaluation_env
+        )
+
+    print(evaluation_env.observation_space)
     rng = np.random.default_rng(seed)
 
     print("load base expert dataset from ", dataset_file)
@@ -108,21 +132,30 @@ def main(
         expert_trajectories = expert_trajectories[:num_demos]
         transitions = rollout.flatten_trajectories(expert_trajectories)
 
+    print("obs shape: ", transitions[0]["obs"].shape)
     print("number of transitions: ", len(transitions))
 
-    policy = CustomPolicy(
-        observation_space=env.observation_space,
-        action_space=env.action_space,
+    if image_based:
+        policy_cls = CustomCNNPolicy
+    else:
+        policy_cls = CustomMLPPolicy
+
+    policy = policy_cls(
+        observation_space=evaluation_env.observation_space,
+        action_space=evaluation_env.action_space,
         lr_schedule=lambda _: torch.finfo(torch.float32).max,
     )
     policy = policy.to(device)
     print(policy)
     print("policy parameters untrained: ", policy.action_net.weight[0][0])
 
+    # import ipdb
+
+    # ipdb.set_trace()
     # create BC trainer
     bc_trainer = bc.BC(
-        observation_space=env.observation_space,
-        action_space=env.action_space,
+        observation_space=evaluation_env.observation_space,
+        action_space=evaluation_env.action_space,
         demonstrations=transitions,
         rng=rng,
         policy=policy,
@@ -150,7 +183,7 @@ def main(
         bc_trainer.train(
             n_epochs=num_bc_epochs,
             progress_bar=True,
-            log_rollouts_n_episodes=5,
+            log_rollouts_n_episodes=n_eval_episodes,
             log_rollouts_venv=evaluation_env,
         )
 
@@ -172,14 +205,15 @@ def main(
             / env_name
             / f"demos_{num_demos}"
             / f"e_{num_bc_epochs}"
+            / f"image_{image_based}"
         )
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         eval_file = ckpt_dir / f"eval_s_{seed}.txt"
 
         with open(eval_file, "w") as f:
             f.write(f"rew: {mean_reward}, std: {std_reward}, sr: {sr}")
 
         ckpt_path = ckpt_dir / f"s_{seed}.zip"
-        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         print("Saving the trained policy to ", ckpt_path)
         save_policy(policy, ckpt_path)
 
