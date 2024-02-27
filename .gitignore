@@ -1,0 +1,7 @@
+__pycache__/*
+datasets/*
+bc_policies/*
+notebooks/*
+*.npy
+compile.py
+*.egg-info
