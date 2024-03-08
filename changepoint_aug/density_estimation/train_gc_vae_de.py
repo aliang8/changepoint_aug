@@ -1,13 +1,5 @@
 """
 Train VAE for cond conditioned density estimation
-
-Usage:
-python3 train_gc_vae_de.py \
-    --config=configs/vae_config.py \
-    --config.mode=train \
-    --config.data_file=bc_policy_rollouts_100.pkl \
-    --config.dataset=MAZE \
-    --config.results_file=vae_params_maze_full_obs.pkl \
 """
 
 import os
@@ -21,12 +13,7 @@ from typing import NamedTuple
 import pickle
 import tqdm
 import torch
-from utils import (
-    NumpyLoader,
-    create_learning_rate_fn,
-    load_maze_data,
-    frange_cycle_linear,
-)
+from utils import frange_cycle_linear
 from models import vae_fn
 from flax.training.train_state import TrainState
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_flags
@@ -38,38 +25,31 @@ from tensorflow_probability.substrates import jax as tfp
 
 dist = tfp.distributions
 
-_CONFIG = config_flags.DEFINE_config_file("config")
-
 
 class CVAETrainer(BaseTrainer):
     def __init__(self, config: FrozenConfigDict):
+        self.loss_keys = [
+            ("kl_div_weight", mlogger.metric.Simple, "both", "KL Weight"),
+            ("kl_div_loss", mlogger.metric.Average, "both", "KL Div Loss"),
+            ("recon_loss", mlogger.metric.Average, "both", "Reconstruction Loss"),
+            (
+                "prior_matching_loss",
+                mlogger.metric.Average,
+                "both",
+                "Prior Matching Loss",
+            ),
+        ]
+
         super().__init__(config)
         # self.obs_dim = self.dataset[:][0].shape[-1] - 2
         self.obs_dim = 2  # just use x,y for maze data
         self.cond_dim = self.config.cond_dim
 
         self.ts = self.create_ts(next(self.rng_seq))
-
-        self.loss_keys = [
-            ("kl_div_weight", mlogger.metric.Simple, "KL Weight"),
-            ("kl_div_loss", mlogger.metric.Average, "KL Div Loss"),
-            ("recon_loss", mlogger.metric.Average, "Reconstruction Loss"),
-            ("prior_matching_loss", mlogger.metric.Average, "Prior Matching Loss"),
-        ]
-        for lk, logger_cls, title in self.loss_keys:
-            self.xp.train.__setattr__(
-                lk,
-                logger_cls(plotter=self.plotter, plot_title=title, plot_legend="train"),
-            )
-            self.xp.test.__setattr__(
-                lk,
-                logger_cls(plotter=self.plotter, plot_title=title, plot_legend="test"),
-            )
-
         self.kl_scheduler = frange_cycle_linear(
             self.config.num_epochs * len(self.train_loader),
             start=0.0,
-            stop=1e-2,
+            stop=self.config.kl_div_weight,
             n_cycle=4,
         )
 
@@ -167,11 +147,7 @@ class CVAETrainer(BaseTrainer):
         self.ts, vae_loss, metrics = self.jit_update_step(
             self.ts, next(self.rng_seq), obs, cond, kl_div_weight
         )
-
-        for lk in metrics.keys():
-            self.xp.train.__getattribute__(lk).update(
-                metrics[lk].item(), weighting=obs.shape[0]
-            )
+        return metrics
 
     def test(self, epoch):
         for batch in self.test_loader:
@@ -196,17 +172,3 @@ class CVAETrainer(BaseTrainer):
                 self.xp.test.__getattribute__(lk).update(
                     metrics[lk].item(), weighting=obs.shape[0]
                 )
-
-
-def main(_):
-    config = _CONFIG.value
-    print(config)
-    trainer = CVAETrainer(config)
-    if config.mode == "train":
-        trainer.train()
-    elif config.mode == "eval":
-        trainer.eval()
-
-
-if __name__ == "__main__":
-    app.run(main)

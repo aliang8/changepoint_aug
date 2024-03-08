@@ -37,7 +37,7 @@ class GaussianPolicy(hk.Module):
         action_dist = dist.Normal(loc=mean, scale=stddev)
         action = action_dist.sample(seed=hk.next_rng_key())
         log_prob = action_dist.log_prob(action)
-        return action, action_dist, log_prob
+        return action, log_prob, mean, stddev
 
 
 # train ensemble of policies
@@ -49,8 +49,11 @@ class Policy(hk.Module):
 
     def __call__(self, obs):
         obs = hk.Flatten()(obs)
-        obs = hk.nets.MLP([self.hidden_size, self.hidden_size, self.action_dim])(obs)
-        return obs
+        action = hk.nets.MLP(
+            [self.hidden_size, self.hidden_size, self.action_dim],
+            activation=jax.nn.leaky_relu,
+        )(obs)
+        return action
 
 
 class QFunction(hk.Module):
@@ -66,6 +69,16 @@ class QFunction(hk.Module):
             activation=jax.nn.leaky_relu,
         )(input)
         return q
+
+
+@hk.transform
+def policy_fn(obs, hidden_size, action_dim):
+    return Policy(hidden_size, action_dim)(obs)
+
+
+@hk.transform
+def gaussian_policy_fn(obs, hidden_size, action_dim):
+    return GaussianPolicy(hidden_size, action_dim)(obs)
 
 
 @hk.transform
@@ -176,9 +189,6 @@ class VAE(hk.Module):
     prior: ConditionalPrior
 
     def __call__(self, obs: jnp.ndarray, cond: jnp.ndarray) -> VAEOutput:
-        obs = obs.astype(jnp.float32)
-        cond = cond.astype(jnp.float32)
-
         # q(z| s, g)
         mean, stddev = self.encoder(obs, cond)
 

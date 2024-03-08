@@ -1,15 +1,8 @@
 """
 Train Q-function using SARSA loss
-
-Usage:
-python3 train_q_sarsa.py \
-    --config=configs/q_config.py \
-    --config.mode=train \
-    --config.data_file=bc_policy_rollouts_100.pkl \
 """
 
 from absl import app
-from utils import load_maze_data, run_rollout_maze
 import jax
 import optax
 import jax.numpy as jnp
@@ -27,37 +20,18 @@ from flax.training.train_state import TrainState
 from typing import Any
 from base_trainer import BaseTrainer
 import mlogger
-
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-
-_CONFIG = config_flags.DEFINE_config_file("config")
+import utils as utils
+import matplotlib.pyplot as plt
 
 
 class QTrainer(BaseTrainer):
     def __init__(self, config: FrozenConfigDict):
+        self.loss_keys = [
+            ("q_loss", mlogger.metric.Average, "both", "Q Loss"),
+        ]
         super().__init__(config)
 
-        # load data
-        data_file = os.path.join(config.data_dir, config.data_file)
-        _, self.train_dataloader, self.test_dataloader, obs_dim, action_dim = (
-            load_maze_data(
-                data_file,
-                batch_size=config.batch_size,
-                num_trajs=config.num_trajs,
-                train_perc=config.train_perc,
-            )
-        )
-        self.obs_dim = obs_dim
-        self.action_dim = action_dim
-
-        self.xp.train.q_loss = mlogger.metric.Average(
-            plotter=self.plotter, plot_title="Q Loss", plot_legend="train"
-        )
-        self.xp.test.q_loss = mlogger.metric.Average(
-            plotter=self.plotter, plot_title="Q Loss", plot_legend="test"
-        )
-
+        # self.obs_dim = 2
         self.ts = self.create_ts(next(self.rng_seq))
         self.jit_update_step = jax.jit(self.update_q_step)
 
@@ -71,10 +45,12 @@ class QTrainer(BaseTrainer):
         q_tp1 = jnp.squeeze(q_tp1, axis=-1)
         backup = rewards + self.config.gamma * (1 - dones) * q_tp1
         loss_q = optax.squared_error(q, backup).mean()
-        return loss_q
+
+        metrics = {"q_loss": loss_q}
+        return loss_q, metrics
 
     def update_q_step(self, ts, obss, actions, obss_tp1, actions_tp1, rewards, dones):
-        td_loss, grads = jax.value_and_grad(self.td_loss_fn)(
+        (td_loss, metrics), grads = jax.value_and_grad(self.td_loss_fn, has_aux=True)(
             ts.params,
             ts,
             obss,
@@ -85,7 +61,7 @@ class QTrainer(BaseTrainer):
             dones,
         )
         ts = ts.apply_gradients(grads=grads)
-        return ts, td_loss
+        return ts, td_loss, metrics
 
     def create_ts(self, rng_key):
         sample_obs = jnp.zeros((1, self.obs_dim))
@@ -114,17 +90,24 @@ class QTrainer(BaseTrainer):
 
     def train_step(self, batch):
         obss, actions, obss_tp1, actions_tp1, rewards, dones = batch
+
+        obss = obss[:, : self.obs_dim]
+        obss_tp1 = obss_tp1[:, : self.obs_dim]
+
         # update q-function
-        self.ts, q_loss = self.jit_update_step(
+        self.ts, q_loss, metrics = self.jit_update_step(
             self.ts, obss, actions, obss_tp1, actions_tp1, rewards, dones
         )
-
-        self.xp.train.q_loss.update(q_loss.item(), weighting=obss.shape[0])
+        return metrics
 
     def test(self, epoch):
-        for batch in self.test_dataloader:
+        for batch in self.test_loader:
             obss, actions, obss_tp1, actions_tp1, rewards, dones = batch
-            q_loss = self.td_loss_fn(
+
+            obss = obss[:, : self.obs_dim]
+            obss_tp1 = obss_tp1[:, : self.obs_dim]
+
+            q_loss, metrics = self.td_loss_fn(
                 self.ts.params,
                 self.ts,
                 obss,
@@ -134,18 +117,34 @@ class QTrainer(BaseTrainer):
                 rewards,
                 dones,
             )
-            self.xp.test.q_loss.update(q_loss.item(), weighting=obss.shape[0])
 
+            if self.config.logger_cls == "vizdom":
+                for lk in metrics.keys():
+                    self.xp.test.__getattribute__(lk).update(
+                        metrics[lk].item(), weighting=obss.shape[0]
+                    )
 
-def main(_):
-    config = _CONFIG.value
-    print(config)
-    trainer = QTrainer(config)
-    if config.mode == "train":
-        trainer.train()
-    elif config.mode == "eval":
-        trainer.eval()
+        # visualize Q-values for random trajectory
+        start_indices = np.where(self.dataset[:][-1])[0]
+        start_indices += 1
+        start_indices = np.insert(start_indices, 0, 0)
+        (all_obss, all_actions, _, _, all_rewards, _) = self.dataset[:]
 
+        # select random trajectory
+        traj_indx = np.random.randint(0, len(start_indices) - 1)
+        start = start_indices[traj_indx]
+        end = start_indices[traj_indx + 1]
+        obss = all_obss[start:end].numpy()
 
-if __name__ == "__main__":
-    app.run(main)
+        # [x,y,x_vel,y_vel]
+        goal = obss[0][4:6]
+        obss = obss[:, : self.obs_dim]
+        actions = all_actions[start:end].numpy()
+        rewards = all_rewards[start:end].numpy()
+        utils.visualize_q_trajectory(
+            self.ts, self.config.env, next(self.rng_seq), obss, actions, rewards, goal
+        )
+        if self.config.logger_cls == "vizdom":
+            self.plotter.viz.matplot(
+                plt, env=self.plotter.viz.env, win=f"viz_ep_{epoch}"
+            )
