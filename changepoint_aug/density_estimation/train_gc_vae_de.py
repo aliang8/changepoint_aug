@@ -46,6 +46,7 @@ class CVAETrainer(BaseTrainer):
         self.cond_dim = self.config.cond_dim
 
         self.ts = self.create_ts(next(self.rng_seq))
+
         self.kl_scheduler = frange_cycle_linear(
             self.config.num_epochs * len(self.train_loader),
             start=0.0,
@@ -142,11 +143,14 @@ class CVAETrainer(BaseTrainer):
         else:
             kl_div_weight = self.config.kl_div_weight
 
-        self.xp.train.kl_div_weight.update(kl_div_weight)
+        if self.config.logger_cls == "vizdom":
+            self.xp.train.kl_div_weight.update(kl_div_weight)
 
         self.ts, vae_loss, metrics = self.jit_update_step(
             self.ts, next(self.rng_seq), obs, cond, kl_div_weight
         )
+        metrics["kl_weight"] = kl_div_weight
+
         return metrics
 
     def test(self, epoch):
@@ -168,7 +172,11 @@ class CVAETrainer(BaseTrainer):
                 self.config.kl_div_weight,
             )
 
-            for lk in metrics.keys():
-                self.xp.test.__getattribute__(lk).update(
-                    metrics[lk].item(), weighting=obs.shape[0]
-                )
+            if self.config.logger_cls == "vizdom":
+                for lk in metrics.keys():
+                    self.xp.test.__getattribute__(lk).update(
+                        metrics[lk].item(), weighting=obs.shape[0]
+                    )
+            elif self.wandb_run:
+                test_metrics = {f"test/{k}": v for k, v in metrics.items()}
+                self.wandb_run.log(test_metrics, step=self.global_step)

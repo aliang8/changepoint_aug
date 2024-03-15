@@ -41,6 +41,8 @@ from train_gc_vae_de import CVAETrainer
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+
 
 _CONFIG = config_flags.DEFINE_config_file("config")
 
@@ -67,7 +69,8 @@ param_space = {
     # "lr": tune.grid_search([1e-3, 1e-4]),
     # "hidden_size": tune.grid_search([64, 128, 256]),
     # "gamma": tune.grid_search([0.99, 0.9]),
-    "num_trajs": tune.grid_search([5]),
+    "data_file": tune.grid_search(["sac_maze_100.pkl"]),
+    "num_trajs": tune.grid_search([5, 10, 25, 50, 75, 100]),
 }
 
 
@@ -102,11 +105,13 @@ def train_model_fn(config):
 
 
 def trial_str_creator(trial):
-    trial_str = ""
+    trial_str = trial.config["exp_name"] + "_"
     for k, v in trial.config.items():
         if k in psh and k in param_space:
             trial_str += f"{psh[k]}-{v}_"
     # trial_str += str(trial.trial_id)
+
+    trial_str = trial_str[:-1]
     print("trial_str: ", trial_str)
     return trial_str
 

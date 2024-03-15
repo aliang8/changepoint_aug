@@ -15,6 +15,7 @@ from tensordict import TensorDict
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict
 from pathlib import Path
 import os
+import wandb
 import metaworld
 
 os.environ["MUJOCO_GL"] = "egl"
@@ -309,7 +310,7 @@ def load_pkl_dataset(
     )
 
 
-def run_rollouts(ts, rng_key, config: ConfigDict):
+def run_rollouts(ts, rng_key, config: ConfigDict, wandb_run=None):
     env = make_env(
         config.env,
         config.env_id,
@@ -323,6 +324,8 @@ def run_rollouts(ts, rng_key, config: ConfigDict):
     rollouts = []
 
     video_dir = Path(config.root_dir) / config.video_dir
+
+    all_videos = []
 
     for rollout_idx in tqdm.tqdm(
         range(config.num_eval_episodes), disable=config.disable_tqdm
@@ -399,9 +402,10 @@ def run_rollouts(ts, rng_key, config: ConfigDict):
 
             done = done or truncated
 
-            if config.save_video:
+            if config.save_video or wandb_run is not None:
                 img = env.render()
                 all_frames.append(img)
+
             t += 1
             rollouts.append((obs, next_obs, action, reward, done, truncated, info))
 
@@ -418,12 +422,34 @@ def run_rollouts(ts, rng_key, config: ConfigDict):
         all_rewards.append(total_reward)
         all_lengths.append(t)
 
+        # save video to wandb
+        # if wandb_run:
+        #     video = np.array(all_frames)
+        #     video = video.transpose(0, 3, 1, 2)
+        #     wandb_run.log({f"rollout": wandb.Video(video, fps=30, format="mp4")})
+
+        all_frames = np.array(all_frames)
+        all_frames = all_frames.transpose(0, 3, 1, 2)
+        if len(all_frames) < 500:
+            all_videos.append(all_frames)
+
         if config.save_video:
             imageio.mimsave(
                 os.path.join(video_dir, f"rollout_{rollout_idx}.mp4"),
                 all_frames,
                 fps=30,
             )
+
+    # combine videos together
+    if wandb_run:
+        if len(all_videos) > 0:
+            max_len = max(len(v) for v in all_videos)
+            all_videos = [
+                np.pad(v, ((0, max_len - len(v)), (0, 0), (0, 0), (0, 0)))
+                for v in all_videos
+            ]
+            all_videos = np.stack(all_videos)
+            wandb_run.log({f"rollout": wandb.Video(all_videos, fps=30, format="mp4")})
 
     print("average return: ", np.mean(all_rewards))
     print("average success rate: ", num_successes / config.num_eval_episodes)
@@ -518,6 +544,7 @@ def visualize_policy_var(ts, rng_key, config, obss, goal):
     axes[0].axvline(x=max_var_idx, color="r", linestyle="--", linewidth=4)
     max_var_point = obss[max_var_idx, :2]
     axes[1].plot(max_var_point[0], max_var_point[1], "ro")
+    return fig
 
 
 def visualize_q_trajectory(ts, env, rng_key, obss, actions, rewards, goal):
@@ -590,3 +617,5 @@ def visualize_q_trajectory(ts, env, rng_key, obss, actions, rewards, goal):
         # make a point in axes[2]
         max_var_point = obss[max_var_idx, :2]
         axes[2].plot(max_var_point[0], max_var_point[1], "ro")
+
+    return fig

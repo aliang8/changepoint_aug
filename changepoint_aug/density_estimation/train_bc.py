@@ -9,6 +9,9 @@ import os
 import tqdm
 import pickle
 import time
+import io
+import wandb
+from PIL import Image
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict
 from functools import partial
 from ml_collections import config_flags
@@ -121,6 +124,10 @@ class BCTrainer(BaseTrainer):
                 self.ts.params, self.ts, obss, actions, next(self.rng_seq)
             )
 
+            if self.wandb_run:
+                test_metrics = {f"test/{k}": v for k, v in metrics.items()}
+                self.wandb_run.log(test_metrics, step=self.global_step)
+
             if self.config.logger_cls == "vizdom":
                 for lk in metrics.keys():
                     self.xp.test.__getattribute__(lk).update(
@@ -128,18 +135,23 @@ class BCTrainer(BaseTrainer):
                     )
 
         # run rollouts to test trained policy
-        rollouts, metrics = utils.run_rollouts(
+        rollouts, rollout_metrics = utils.run_rollouts(
             self.ts,
             rng_key=next(self.rng_seq),
             config=self.config,
+            wandb_run=self.wandb_run,
         )
 
+        if self.wandb_run:
+            rollout_metrics = {f"rollout/{k}": v for k, v in rollout_metrics.items()}
+            self.wandb_run.log(rollout_metrics)
+
         if self.config.logger_cls == "vizdom":
-            for lk in metrics.keys():
-                if isinstance(metrics[lk], (int, float)):
-                    metric = metrics[lk]
+            for lk in rollout_metrics.keys():
+                if isinstance(rollout_metrics[lk], (int, float)):
+                    metric = rollout_metrics[lk]
                 else:
-                    metric = metrics[lk].item()
+                    metric = rollout_metrics[lk].item()
                 self.xp.test.__getattribute__(lk).update(metric, weighting=1)
 
         # visualize
@@ -156,9 +168,21 @@ class BCTrainer(BaseTrainer):
         obss = all_obss[start:end].numpy()
         goal = obss[0][4:6]
         obss = obss[:, : self.obs_dim]
-        utils.visualize_policy_var(self.ts, next(self.rng_seq), self.config, obss, goal)
+        fig = utils.visualize_policy_var(
+            self.ts, next(self.rng_seq), self.config, obss, goal
+        )
 
         if self.config.logger_cls == "vizdom":
             self.plotter.viz.matplot(
                 plt, env=self.plotter.viz.env, win=f"viz_ep_{epoch}"
             )
+        elif self.wandb_run:
+            # save as image instead of plotly interactive figure
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", dpi=100)
+            buf.seek(0)
+            wandb.log(({"viz/policy_var_trajectory": wandb.Image(Image.open(buf))}))
+
+            # self.wandb_run.log(
+            #     {"viz/policy_var_trajectory": fig}, step=self.global_step
+            # )

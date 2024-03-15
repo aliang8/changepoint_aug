@@ -14,6 +14,9 @@ import tqdm
 import pickle
 import time
 import flax
+import io
+import wandb
+from PIL import Image
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_flags
 from functools import partial
 from flax.training.train_state import TrainState
@@ -124,6 +127,10 @@ class QTrainer(BaseTrainer):
                         metrics[lk].item(), weighting=obss.shape[0]
                     )
 
+            if self.wandb_run:
+                test_metrics = {f"test/{k}": v for k, v in metrics.items()}
+                self.wandb_run.log(test_metrics, step=self.global_step)
+
         # visualize Q-values for random trajectory
         start_indices = np.where(self.dataset[:][-1])[0]
         start_indices += 1
@@ -141,10 +148,17 @@ class QTrainer(BaseTrainer):
         obss = obss[:, : self.obs_dim]
         actions = all_actions[start:end].numpy()
         rewards = all_rewards[start:end].numpy()
-        utils.visualize_q_trajectory(
+        fig = utils.visualize_q_trajectory(
             self.ts, self.config.env, next(self.rng_seq), obss, actions, rewards, goal
         )
         if self.config.logger_cls == "vizdom":
             self.plotter.viz.matplot(
                 plt, env=self.plotter.viz.env, win=f"viz_ep_{epoch}"
             )
+        elif self.wandb_run:
+            # save as image instead of plotly interactive figure
+            buf = io.BytesIO()
+            plt.savefig(buf, format="png", dpi=300)
+            buf.seek(0)
+            wandb.log(({"viz/q_trajectory": wandb.Image(Image.open(buf))}))
+            # self.wandb_run.log({"viz/q_trajectory": fig}, step=self.global_step)

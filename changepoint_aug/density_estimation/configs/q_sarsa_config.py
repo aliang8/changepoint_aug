@@ -5,7 +5,7 @@ from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_
 def get_config():
     config = get_base_config()
     config.trainer = "q_sarsa"
-    config.ray_experiment_name = "2_offline_q_sarsa"
+    config.exp_name = "q_sarsa"
     config.vizdom_name = "q_2"
 
     # qfunction

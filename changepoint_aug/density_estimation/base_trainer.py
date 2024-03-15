@@ -55,7 +55,7 @@ class BaseTrainer:
                 # set the wandb project where this run will be logged
                 entity="glamor",
                 project="data_augmentation",
-                name="test",
+                name=config.exp_name,
                 notes=self.config.notes,
                 tags=self.config.tags,
                 # track hyperparameters and run metadata
@@ -170,9 +170,6 @@ class BaseTrainer:
                 if self.config.logger_cls == "vizdom":
                     for metric in self.xp.test.metrics():
                         metric.log()
-                elif self.wandb_run:
-                    test_metrics = {f"test/{k}": v for k, v in test_metrics.items()}
-                    self.wandb_run.log(test_metrics, step=self.global_step)
 
             if self.config.logger_cls == "vizdom":
                 # reset log metrics

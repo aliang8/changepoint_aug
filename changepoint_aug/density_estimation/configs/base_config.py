@@ -9,7 +9,7 @@ def get_base_config():
     config.data_dir = (
         "/scr/aliang80/changepoint_aug/changepoint_aug/density_estimation/datasets"
     )
-    config.data_file = "sac_maze_dense_reward_200_episodes.pkl"
+    config.data_file = "sac_maze_200.pkl"
     config.video_dir = "videos"
     config.batch_size = 128
     config.hidden_size = 128
@@ -17,7 +17,7 @@ def get_base_config():
     config.num_epochs = 200
     config.train_perc = 0.9
     config.shuffle_dataset = True
-    config.test_interval = 10
+    config.test_interval = 20
     config.save_interval = 20
     config.num_eval_episodes = 10
     config.max_episode_steps = 1000

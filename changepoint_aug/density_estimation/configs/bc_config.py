@@ -5,7 +5,7 @@ from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_
 def get_config():
     config = get_base_config()
     config.trainer = "bc"
-    config.ray_experiment_name = "bc"
+    config.exp_name = "bc"
     config.vizdom_name = "bc"
 
     # policies
