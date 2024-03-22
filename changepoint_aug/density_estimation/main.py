@@ -1,47 +1,27 @@
-"""
-Train Q-function 
-
-Usage:
-python3 main.py \
-    --config=configs/q_sarsa_config.py \
-    --config.mode=train \
-    
-python3 main.py \
-    --config=configs/bc_config.py \
-    --config.mode=train \
-    --config.exp_name=2_bc
-
-python3 main.py \
-    --config=configs/vae_config.py \
-    --config.mode=train \
-    --config.exp_name=2_vae
-"""
-
-from absl import app
+from absl import app, logging
 import jax
 import optax
 import jax.numpy as jnp
 import numpy as np
 import haiku as hk
 import os
+import re
 import tqdm
 import pickle
 import time
 import flax
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_flags
 from typing import Any
-import mlogger
 import pickle
 from pathlib import Path
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
-from train_q_sarsa import QTrainer
-from train_bc import BCTrainer
-from train_gc_vae_de import CVAETrainer
+
+from changepoint_aug.density_estimation.trainers import *
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 
 _CONFIG = config_flags.DEFINE_config_file("config")
@@ -59,28 +39,43 @@ psh = {
     "policy_cls": "pc",
     "num_policies": "np",
     "num_eval_episodes": "nee",
+    "seed": "s",
+    "kl_div_weight": "kl",
 }
 
 # run with ray tune
 param_space = {
     # "latent_dim": tune.grid_search([5, 8]),
-    # "kl_div_weight": tune.grid_search([1e-1, 1e-2]),
-    # "seed": tune.grid_search([0, 1]),
+    # "kl_div_weight": tune.grid_search([0.5, 1.0, 5.0]),
     # "lr": tune.grid_search([1e-3, 1e-4]),
     # "hidden_size": tune.grid_search([64, 128, 256]),
     # "gamma": tune.grid_search([0.99, 0.9]),
-    "data_file": tune.grid_search(["sac_maze_100.pkl"]),
-    "num_trajs": tune.grid_search([5, 10, 25, 50, 75, 100]),
+    # "seed": tune.grid_search([0, 1, 2]),
+    # "data_file": tune.grid_search(["sac_maze_200.pkl"]),
+    # "num_trajs": tune.grid_search([5, 10, 25, 50, 75]),
+    # "num_trajs": tune.grid_search([100, 125, 150, 175, 200]),
+    "num_trajs": tune.grid_search([25, 50, 100, 200]),
 }
+
+# param_space = {
+#     "seed": tune.grid_search([0]),
+#     "data_file": tune.grid_search(["sac_maze_100.pkl"]),
+#     "num_trajs": tune.grid_search([5]),
+# }
 
 
 def train_model_fn(config):
     trial_dir = train.get_context().get_trial_dir()
+
     if trial_dir:
-        print("Trial dir: ", trial_dir)
+        # this is if we are running with Ray
+        logging.info("trial dir: ", trial_dir)
         config["root_dir"] = Path(trial_dir)
         base_name = Path(trial_dir).name
         config["exp_name"] = base_name
+        # the group name is without seed
+        config["group_name"] = re.sub("_s-\d", "", base_name)
+        logging.info(f"wandb group name: {config['group_name']}")
     else:
         suffix = f"{config['exp_name']}_s-{config['seed']}_t-{config['trainer']}"
         config["root_dir"] = Path(config["root_dir"]) / "results" / suffix
@@ -112,20 +107,21 @@ def trial_str_creator(trial):
     # trial_str += str(trial.trial_id)
 
     trial_str = trial_str[:-1]
-    print("trial_str: ", trial_str)
+    logging.info(f"trial_str: {trial_str}")
     return trial_str
 
 
 def main(_):
     config = _CONFIG.value.to_dict()
     if config["smoke_test"] is False:
+        config["use_wb"] = True  # always log to wandb when we are running with ray tune
         config.update(param_space)
-        train_model = tune.with_resources(train_model_fn, {"cpu": 1, "gpu": 0.2})
+        train_model = tune.with_resources(train_model_fn, {"cpu": 3, "gpu": 0.1})
 
         run_config = RunConfig(
             name=config["exp_name"],
-            local_dir="/scr/aliang80/changepoint_aug/changepoint_aug/ray_results",
-            storage_path="/scr/aliang80/changepoint_aug/changepoint_aug/ray_results",
+            local_dir="/scr/aliang80/changepoint_aug/changepoint_aug/density_estimation/ray_results",
+            storage_path="/scr/aliang80/changepoint_aug/changepoint_aug/density_estimation/ray_results",
             log_to_file=True,
         )
         tuner = tune.Tuner(
@@ -138,7 +134,7 @@ def main(_):
             ),
         )
         results = tuner.fit()
-        print(results)
+        logging.info(results)
     else:
         # run without ray tune
         train_model_fn(config)

@@ -1,10 +1,9 @@
-from absl import app
+from absl import logging
 import jax
 import optax
 import jax.numpy as jnp
 import numpy as np
 import haiku as hk
-from models import GaussianPolicy
 import os
 import tqdm
 import pickle
@@ -14,33 +13,57 @@ import wandb
 from PIL import Image
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict
 from functools import partial
-from ml_collections import config_flags
 from flax.training.train_state import TrainState
-import mlogger
-from models import policy_fn, gaussian_policy_fn
-from base_trainer import BaseTrainer
 from tensorflow_probability.substrates import jax as tfp
 import utils as utils
 import matplotlib.pyplot as plt
+from collections import Counter
+
+from changepoint_aug.density_estimation.trainers.base_trainer import BaseTrainer
+from changepoint_aug.density_estimation.models import policy_fn, gaussian_policy_fn
+from changepoint_aug.density_estimation.visualize import visualize_policy_var
 
 dist = tfp.distributions
 
 
+def create_ts(config, obs_dim, action_dim, rng_key):
+    sample_obs = jnp.zeros((1, obs_dim))
+    policy_apply = policy_fn if config.policy_cls == "mlp" else gaussian_policy_fn
+
+    if config.load_from_ckpt != "":
+        params = pickle.load(open(config.load_from_ckpt, "rb"))
+    else:
+        policy_rng_keys = jax.random.split(rng_key, config.num_policies + 1)
+        params = jax.vmap(policy_apply.init, in_axes=(0, None, None, None))(
+            policy_rng_keys[1:], sample_obs, config.hidden_size, action_dim
+        )
+
+    opt = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(config.lr),
+    )
+    # create
+    policy_apply = partial(
+        jax.jit(policy_apply.apply, static_argnums=(3, 4)),
+        hidden_size=config.hidden_size,
+        action_dim=action_dim,
+    )
+
+    ts = TrainState.create(
+        apply_fn=policy_apply,
+        params=params,
+        tx=opt,
+    )
+
+    param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
+    logging.info(f"Number of policy parameters: {param_count}")
+    return ts
+
+
 class BCTrainer(BaseTrainer):
     def __init__(self, config: FrozenConfigDict):
-        self.loss_keys = [
-            ("bc_loss", mlogger.metric.Average, "both", "BC Loss"),
-            ("average_return", mlogger.metric.Average, "test", "Eval Returns"),
-            (
-                "average_success_rate",
-                mlogger.metric.Average,
-                "test",
-                "Eval Success Rate",
-            ),
-            ("average_length", mlogger.metric.Average, "test", "Eval Episode Length"),
-        ]
         super().__init__(config)
-        self.ts = self.create_ts(next(self.rng_seq))
+        self.ts = create_ts(config, self.obs_dim, self.action_dim, next(self.rng_seq))
         self.jit_update_step = jax.jit(self.update_step)
 
     def bc_loss_fn(self, params, ts, obss, actions, rng_key):
@@ -72,38 +95,6 @@ class BCTrainer(BaseTrainer):
         ts = ts.apply_gradients(grads=grads)
         return ts, bc_loss, metrics
 
-    def create_ts(self, rng_key):
-        sample_obs = jnp.zeros((1, self.obs_dim))
-        policy_rng_keys = jax.random.split(rng_key, self.config.num_policies + 1)
-
-        policy_apply = (
-            policy_fn if self.config.policy_cls == "mlp" else gaussian_policy_fn
-        )
-
-        params = jax.vmap(policy_apply.init, in_axes=(0, None, None, None))(
-            policy_rng_keys[1:], sample_obs, self.config.hidden_size, self.action_dim
-        )
-        opt = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adam(self.config.lr),
-        )
-        # create
-        policy_apply = partial(
-            jax.jit(policy_apply.apply, static_argnums=(3, 4)),
-            hidden_size=self.config.hidden_size,
-            action_dim=self.action_dim,
-        )
-
-        ts = TrainState.create(
-            apply_fn=policy_apply,
-            params=params,
-            tx=opt,
-        )
-
-        param_count = sum(p.size for p in jax.tree_util.tree_leaves(params))
-        print(f"Number of parameters: {param_count}")
-        return ts
-
     def train_step(self, batch):
         obss, actions, *_ = batch
         obss = obss[:, : self.obs_dim]
@@ -115,6 +106,7 @@ class BCTrainer(BaseTrainer):
         return metrics
 
     def test(self, epoch):
+        avg_test_metrics = Counter()
         for batch in self.test_loader:
             obss, actions, *_ = batch
 
@@ -123,16 +115,10 @@ class BCTrainer(BaseTrainer):
             bc_loss, metrics = self.bc_loss_fn(
                 self.ts.params, self.ts, obss, actions, next(self.rng_seq)
             )
+            avg_test_metrics += Counter(metrics)
 
-            if self.wandb_run:
-                test_metrics = {f"test/{k}": v for k, v in metrics.items()}
-                self.wandb_run.log(test_metrics, step=self.global_step)
-
-            if self.config.logger_cls == "vizdom":
-                for lk in metrics.keys():
-                    self.xp.test.__getattribute__(lk).update(
-                        metrics[lk].item(), weighting=obss.shape[0]
-                    )
+        for k in avg_test_metrics:
+            avg_test_metrics[k] /= len(self.test_loader)
 
         # run rollouts to test trained policy
         rollouts, rollout_metrics = utils.run_rollouts(
@@ -146,19 +132,12 @@ class BCTrainer(BaseTrainer):
             rollout_metrics = {f"rollout/{k}": v for k, v in rollout_metrics.items()}
             self.wandb_run.log(rollout_metrics)
 
-        if self.config.logger_cls == "vizdom":
-            for lk in rollout_metrics.keys():
-                if isinstance(rollout_metrics[lk], (int, float)):
-                    metric = rollout_metrics[lk]
-                else:
-                    metric = rollout_metrics[lk].item()
-                self.xp.test.__getattribute__(lk).update(metric, weighting=1)
-
         # visualize
         # visualize variance over policy ensemble for random trajectory
         start_indices = np.where(self.dataset[:][-1])[0]
         start_indices += 1
         start_indices = np.insert(start_indices, 0, 0)
+        start_indices = start_indices[:-1]
         (all_obss, _, _, _, _, _) = self.dataset[:]
 
         # select random trajectory
@@ -168,21 +147,14 @@ class BCTrainer(BaseTrainer):
         obss = all_obss[start:end].numpy()
         goal = obss[0][4:6]
         obss = obss[:, : self.obs_dim]
-        fig = utils.visualize_policy_var(
-            self.ts, next(self.rng_seq), self.config, obss, goal
-        )
+        fig = visualize_policy_var(self.ts, next(self.rng_seq), self.config, obss, goal)
 
-        if self.config.logger_cls == "vizdom":
-            self.plotter.viz.matplot(
-                plt, env=self.plotter.viz.env, win=f"viz_ep_{epoch}"
-            )
-        elif self.wandb_run:
+        if self.wandb_run:
             # save as image instead of plotly interactive figure
             buf = io.BytesIO()
             plt.savefig(buf, format="png", dpi=100)
             buf.seek(0)
             wandb.log(({"viz/policy_var_trajectory": wandb.Image(Image.open(buf))}))
 
-            # self.wandb_run.log(
-            #     {"viz/policy_var_trajectory": fig}, step=self.global_step
-            # )
+        avg_test_metrics.update(rollout_metrics)
+        return avg_test_metrics

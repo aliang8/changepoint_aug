@@ -19,3 +19,4 @@ changepoint_aug/density_estimation/runs/*
 test.py
 changepoint_aug/density_estimation/wandb/*
 changepoint_aug/ray_results/*
+changepoint_aug/density_estimation/ray_results/*

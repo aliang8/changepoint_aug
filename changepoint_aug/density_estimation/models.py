@@ -202,6 +202,7 @@ class VAE(hk.Module):
 
         # prior(z | g)
         prior_mean, prior_stddev = self.prior(cond)
+
         return VAEOutput(
             mean=mean,
             stddev=stddev,
@@ -223,7 +224,7 @@ class VAE(hk.Module):
 
 
 @hk.transform
-def decode_fn(z, cond, latent_size, hidden_size, obs_dim, cond_dim):
+def decode_fn(cond, z, latent_size, hidden_size, obs_dim, cond_dim):
     encoder = Encoder(latent_size=latent_size, hidden_size=hidden_size)
     decoder = Decoder(hidden_size=hidden_size, obs_dim=obs_dim, cond_dim=cond_dim)
     prior = ConditionalPrior(latent_size=latent_size, hidden_size=hidden_size)

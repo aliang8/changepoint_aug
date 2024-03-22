@@ -18,10 +18,10 @@ import optax
 import matplotlib.pyplot as plt
 from models import q_fn, vae_fn, decode_fn, get_prior_fn
 from functools import partial
-from changepoint_aug.density_estimation.configs.q_sarsa_config import (
+from changepoint_aug.density_estimation.configs.q_sarsa import (
     get_config as get_q_config,
 )
-from configs.vae_config import get_config as get_vae_config
+from changepoint_aug.density_estimation.configs.vae import get_config as get_vae_config
 from tensorflow_probability.substrates import jax as tfp
 from pprint import pprint
 

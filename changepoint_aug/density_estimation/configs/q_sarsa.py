@@ -6,7 +6,8 @@ def get_config():
     config = get_base_config()
     config.trainer = "q_sarsa"
     config.exp_name = "q_sarsa"
-    config.vizdom_name = "q_2"
+    config.save_key = "test/q_loss"
+    config.best_metric = "min"
 
     # qfunction
     config.gamma = 0.99
