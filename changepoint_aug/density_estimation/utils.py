@@ -175,12 +175,15 @@ def run_rollouts(ts, rng_key, config: ConfigDict, wandb_run=None):
     video_dir = Path(config.root_dir) / config.video_dir
 
     all_videos = []
-    obs = env.reset(seed=config.seed)
+
+    obs, _ = env.reset(seed=config.seed)
 
     for rollout_idx in tqdm.tqdm(
         range(config.num_eval_episodes), disable=config.disable_tqdm
     ):
         obs, _ = env.reset()
+
+        # print(f"rollout_idx: {rollout_idx}, obs: {obs}")
 
         done = False
         t = 0

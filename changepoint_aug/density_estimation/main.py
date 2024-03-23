@@ -21,7 +21,7 @@ from changepoint_aug.density_estimation.trainers import *
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 
 _CONFIG = config_flags.DEFINE_config_file("config")
@@ -50,11 +50,11 @@ param_space = {
     # "lr": tune.grid_search([1e-3, 1e-4]),
     # "hidden_size": tune.grid_search([64, 128, 256]),
     # "gamma": tune.grid_search([0.99, 0.9]),
-    # "seed": tune.grid_search([0, 1, 2]),
+    "seed": tune.grid_search([0, 1, 2]),
     # "data_file": tune.grid_search(["sac_maze_200.pkl"]),
     # "num_trajs": tune.grid_search([5, 10, 25, 50, 75]),
     # "num_trajs": tune.grid_search([100, 125, 150, 175, 200]),
-    "num_trajs": tune.grid_search([25, 50, 100, 200]),
+    "num_trajs": tune.grid_search([5, 10, 25, 50, 100, 125]),
 }
 
 # param_space = {
@@ -116,7 +116,7 @@ def main(_):
     if config["smoke_test"] is False:
         config["use_wb"] = True  # always log to wandb when we are running with ray tune
         config.update(param_space)
-        train_model = tune.with_resources(train_model_fn, {"cpu": 3, "gpu": 0.1})
+        train_model = tune.with_resources(train_model_fn, {"cpu": 5, "gpu": 0.3})
 
         run_config = RunConfig(
             name=config["exp_name"],

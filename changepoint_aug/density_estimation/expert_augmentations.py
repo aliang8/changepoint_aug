@@ -12,6 +12,7 @@ import tqdm
 import torch
 import wandb
 import io
+import time
 from PIL import Image
 import jax.numpy as jnp
 import numpy as np
@@ -23,6 +24,7 @@ from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
 import sys
 import os
+import jax.scipy as jsp
 
 sys.path.append("/scr/aliang80/changepoint_aug/changepoint_aug/old")
 from sac_torch import Actor
@@ -35,9 +37,8 @@ from changepoint_aug.density_estimation.trainers.bc import create_ts as create_t
 from changepoint_aug.density_estimation.visualize import estimate_density
 from changepoint_aug.density_estimation.utils import make_env
 
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
+# os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ["MUJOCO_EGL"] = "egl"
 
 
@@ -83,6 +84,44 @@ def postprocess_density(densities, lamb=1.0):
     return densities
 
 
+def compute_jacobian(ts, x):
+    # jax.debug.breakpoint()
+
+    # make a output_dim x num_params Jacobian
+    flat_params, unravel = jax.flatten_util.ravel_pytree(ts.params)
+    jacobian = jax.jacobian(
+        lambda flat_params: ts.apply_fn(unravel(flat_params), None, x)
+    )(flat_params)
+    # jacobian should be 2 x num_params
+    return jacobian
+
+
+def compute_influence_scores(jacs, residuals, lam):
+    G = jax.vmap(lambda j: j.T @ j)(jacs)
+    G = jnp.sum(G, axis=0)
+
+    # evals = jnp.linalg.eigvalsh(G)
+    # # first, we fix the negative eigenvalues
+    # lam = jnp.max(jnp.where(evals < 0, -evals, 0.0))
+    # evals = jnp.where(evals < 0, 0.0, evals)
+
+    # # next, we adjust the positive eigenvalues
+    # tol = 1e-4
+    # lam += jnp.max(jnp.where(evals < tol, tol - evals, 0.0))
+
+    # jax.debug.breakpoint()
+    H_inv = jsp.linalg.solve(
+        G + lam * jnp.eye(G.shape[0]), jnp.eye(G.shape[0])  # , assume_a="pos"
+    )
+    # jax.debug.breakpoint()s
+
+    gs = jax.vmap(lambda j, r: j.T @ r)(jacs, residuals)
+    # jax.debug.breakpoint()
+
+    scores = jax.vmap(lambda g: g.T @ H_inv @ g)(gs)
+    return scores
+
+
 class QueryStateSelector:
     def __init__(self, config: FrozenConfigDict, dataset, wandb_run=None):
         # print current directory
@@ -94,12 +133,16 @@ class QueryStateSelector:
         (all_obss, all_actions, _, _, _, all_dones) = dataset[:]
 
         self.rng_key = jax.random.PRNGKey(config.seed)
-        self.metric = config.selection_metric
+        self.selection_metric = config.selection_metric
         self.obss = all_obss.numpy()
         self.actions = all_actions.numpy()
         self.dones = all_dones.numpy()
 
-        assert self.metric in ["q_variance", "policy_variance"]
+        assert self.selection_metric in [
+            "q_variance",
+            "policy_variance",
+            "influence_function",
+        ]
 
         # TODO: implement sort to get best checkpoint
 
@@ -137,10 +180,13 @@ class QueryStateSelector:
         obs_dim = self.obss.shape[-1]
         action_dim = self.actions.shape[-1]
 
-        if self.metric == "q_variance":
+        if self.selection_metric == "q_variance":
             config.load_from_ckpt = str(model_ckpt_path)
             self.ts = create_ts_q(config, obs_dim, action_dim, None)
-        elif self.metric == "policy_variance":
+        elif (
+            self.selection_metric == "policy_variance"
+            or self.selection_metric == "influence_function"
+        ):
             config.load_from_ckpt = str(model_ckpt_path)
             self.ts = create_ts_bc(config, obs_dim, action_dim, None)
 
@@ -158,8 +204,8 @@ class QueryStateSelector:
             )
 
         # compute metric
-        self.metric = self.compute_metric()
-        self.reweighted_metric = self.metric * self.density_estimates
+        self.selection_metric = self.compute_metric()
+        self.reweighted_metric = self.selection_metric * self.density_estimates
 
     def compute_density_estimates(self):
         """
@@ -198,9 +244,9 @@ class QueryStateSelector:
 
     def compute_metric(self):
         metric = None
-        if self.metric == "q_variance":
+        if self.selection_metric == "q_variance":
             pass
-        elif self.metric == "policy_variance":
+        elif self.selection_metric == "policy_variance":
             logging.info(f"computing policy variance")
             policy_rng_keys = jax.random.split(
                 self.rng_key, self.config.num_policies + 1
@@ -214,7 +260,65 @@ class QueryStateSelector:
             # average over ensemble and sum over action dim
             metric = jnp.var(action_preds, axis=0).sum(axis=-1)
             logging.info(f"done computing policy variance, {metric.shape}")
+        elif self.selection_metric == "influence_function":
+            # this depends on what we want to compute influence of point wrt to
 
+            # let's just use the first policy in ensemble
+            params = jax.tree_map(lambda x: x[0], self.ts.params)
+            self.ts = self.ts.replace(params=params)
+            policy_rng, self.rng_key = jax.random.split(self.rng_key)
+            action_preds = self.ts.apply_fn(self.ts.params, policy_rng, self.obss)
+            residuals = optax.squared_error(self.actions, action_preds)
+
+            # residuals = jnp.mean(residuals, axis=0)
+
+            # compute jacobian of network for each datapoint
+            # num points x output dim x num params
+
+            # need to chunk this, cannot materialize all the jacobians at once
+            chunk_size = 1000
+            chunked_inputs = [
+                self.obss[i : i + chunk_size]
+                for i in range(0, len(self.obss), chunk_size)
+            ]
+
+            residuals_chunked = [
+                residuals[i : i + chunk_size]
+                for i in range(0, len(residuals), chunk_size)
+            ]
+
+            logging.info("computing jacobians")
+
+            start = time.time()
+
+            @jax.jit
+            def func(carry, inputs):
+                inp, residual = inputs
+                jacs = jax.vmap(jax.jit(compute_jacobian), in_axes=(None, 0))(
+                    self.ts, inp
+                )
+                metric = compute_influence_scores(
+                    jacs, residual, self.config.inf_fn_lambda
+                )
+                return carry, metric
+
+            _, metric = jax.lax.scan(
+                func,
+                init=[],
+                xs=(jnp.array(chunked_inputs[:-1]), jnp.array(residuals_chunked[:-1])),
+            )
+
+            final_metric = jax.jit(func)(
+                None, (jnp.array(chunked_inputs[-1]), jnp.array(residuals_chunked[-1]))
+            )[1]
+            metric = np.concatenate(metric, axis=0)
+            metric = np.concatenate([metric, final_metric], axis=0)
+
+            logging.info(
+                f"done computing influence function, time taken: {time.time() - start}"
+            )
+
+        logging.info(f"metric max: {np.max(metric)}, min: {np.min(metric)}")
         return metric
 
     def visualize_selected_states(
@@ -283,7 +387,7 @@ class QueryStateSelector:
                 end = self.start_indices[traj_indx + 1]
                 traj = self.obss[start:end]
 
-                metric_ = self.metric[start:end]
+                metric_ = self.selection_metric[start:end]
                 reweighted_metric_ = np.array(self.reweighted_metric[start:end])
 
                 ax1.set_xlim(min_x, max_x)
@@ -390,7 +494,7 @@ class QueryStateSelector:
             if self.config.reweight_with_density:
                 metric = self.reweighted_metric[start:end]
             else:
-                metric = self.metric[start:end]
+                metric = self.selection_metric[start:end]
 
             selected_indx = np.argpartition(metric, -self.config.top_k)[
                 -self.config.top_k :
@@ -410,7 +514,7 @@ class QueryStateSelector:
         if self.config.reweight_with_density:
             metric = self.reweighted_metric
         else:
-            metric = self.metric
+            metric = self.selection_metric
 
         selected_indices = np.argpartition(metric, -self.config.total_num_states)[
             -self.config.total_num_states :
@@ -460,71 +564,71 @@ def run_augmentation(config, dataset, wandb_run=None):
             selected_indices, selected_state_traj_indx, env
         )
 
-    # STEP 3: Augment selected states with a few steps of expert actions
-    # Perturb states a little bit
+    # # STEP 3: Augment selected states with a few steps of expert actions
+    # # Perturb states a little bit
 
-    # load expert model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    state_dict = torch.load(
-        "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_5M.pt",
-        map_location=device,
-    )
-    envs = gym.vector.SyncVectorEnv([make_env_sac(None, 0, 0, False, "")])
-    actor = Actor(envs).to(device)
-    actor.load_state_dict(state_dict["actor"])
-    actor.eval()
+    # # load expert model
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # state_dict = torch.load(
+    #     "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_5M.pt",
+    #     map_location=device,
+    # )
+    # envs = gym.vector.SyncVectorEnv([make_env_sac(None, 0, 0, False, "")])
+    # actor = Actor(envs).to(device)
+    # actor.load_state_dict(state_dict["actor"])
+    # actor.eval()
 
-    rollouts = []
+    # rollouts = []
 
-    selected_states = selector.obss[selected_indices]
+    # selected_states = selector.obss[selected_indices]
 
-    # total number of new transitions = (# augmentations per state) x (# num total trajs) x (# expert steps)
-    for state in tqdm.tqdm(selected_states):
+    # # total number of new transitions = (# augmentations per state) x (# num total trajs) x (# expert steps)
+    # for state in tqdm.tqdm(selected_states):
 
-        for _ in range(config.num_augmentations_per_state):
-            obs, _ = env.reset_to_state(state)
+    #     for _ in range(config.num_augmentations_per_state):
+    #         obs, _ = env.reset_to_state(state)
 
-            # take some perturbation steps
-            for _ in range(config.num_perturb_steps):
-                action = env.action_space.sample()
-                next_obs, reward, done, truncated, info = env.step(action)
-                obs = next_obs
+    #         # take some perturbation steps
+    #         for _ in range(config.num_perturb_steps):
+    #             action = env.action_space.sample()
+    #             next_obs, reward, done, truncated, info = env.step(action)
+    #             obs = next_obs
 
-            obs_input = np.concatenate(
-                [obs["observation"], obs["desired_goal"], obs["meta"]],
-            )
-            obs_input = obs_input[None]
+    #         obs_input = np.concatenate(
+    #             [obs["observation"], obs["desired_goal"], obs["meta"]],
+    #         )
+    #         obs_input = obs_input[None]
 
-            for _ in range(config.num_expert_steps_aug):
-                # don't use the sampled action
-                action_sample, _, action_mean = actor.get_action(
-                    torch.Tensor(obs_input).to(device)
-                )
-                action = action_mean[0].detach().cpu().numpy()
-                next_obs, reward, done, truncated, info = env.step(action)
-                rollouts.append((obs, next_obs, action, reward, done, truncated, info))
+    #         for _ in range(config.num_expert_steps_aug):
+    #             # don't use the sampled action
+    #             action_sample, _, action_mean = actor.get_action(
+    #                 torch.Tensor(obs_input).to(device)
+    #             )
+    #             action = action_mean[0].detach().cpu().numpy()
+    #             next_obs, reward, done, truncated, info = env.step(action)
+    #             rollouts.append((obs, next_obs, action, reward, done, truncated, info))
 
-                obs = next_obs
+    #             obs = next_obs
 
-    logging.info(f"number of new transitions: {len(rollouts)}")
+    # logging.info(f"number of new transitions: {len(rollouts)}")
 
-    # STEP 4: Save augmented dataset
-    augment_data_file = create_aug_filename(config)
-    save_file = Path(config.data_dir) / augment_data_file
-    logging.info(f"Saving augmented dataset to {save_file}")
-    with open(save_file, "wb") as f:
-        pickle.dump(
-            {
-                "rollouts": rollouts,
-                "metadata": {
-                    "density_model_ckpt_path": selector.density_model_ckpt_path,
-                    "model_ckpt_path": selector.model_ckpt_path,
-                    "num_transitions": len(rollouts),
-                    "config": config.to_dict(),
-                },
-            },
-            f,
-        )
+    # # STEP 4: Save augmented dataset
+    # augment_data_file = create_aug_filename(config)
+    # save_file = Path(config.data_dir) / augment_data_file
+    # logging.info(f"Saving augmented dataset to {save_file}")
+    # with open(save_file, "wb") as f:
+    #     pickle.dump(
+    #         {
+    #             "rollouts": rollouts,
+    #             "metadata": {
+    #                 "density_model_ckpt_path": selector.density_model_ckpt_path,
+    #                 "model_ckpt_path": selector.model_ckpt_path,
+    #                 "num_transitions": len(rollouts),
+    #                 "config": config.to_dict(),
+    #             },
+    #         },
+    #         f,
+    #     )
 
     env.close()
 

@@ -15,5 +15,7 @@ def get_config():
     config.policy_cls = "mlp"
     config.num_trajs = 200
 
-    # config.augmentation_data_files = ["augment_dataset_aug-10_m-policy_variance.pkl"]
+    config.augmentation_data_files = [
+        "augment_dataset_lam-1.3_nap-2_nes-10_nps-2_rwd-True_sel-per_traj_selm-policy_variance_tns-100.pkl"
+    ]
     return config

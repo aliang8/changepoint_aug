@@ -111,21 +111,27 @@ def load_pkl_dataset(
             rollouts.append(rollout)
             rollout = []
 
+    logging.info(f"total transitions in base dataset: {len(data)}")
+
     num_rollouts = len(rollouts)
     logging.info(f"number of rollouts in base dataset: {num_rollouts}")
     avg_rollout_len = sum(len(r) for r in rollouts) / len(rollouts)
     logging.info(f"average length of base rollout: {avg_rollout_len}")
 
+    augmentation_rollouts = []
     for data_file in augmentation_data_files:
         logging.info(f"loading augmentation file: {data_file}")
         data_file = Path(data_dir) / data_file
         with open(data_file, "rb") as f:
             data = pickle.load(f)
 
+        metadata = data["metadata"]
+        data = data["rollouts"]
+
         # split data into list
         rollout = [data[i : i + 10] for i in range(0, len(data), 10)]
-        logging.info(f"num rollouts: {len(rollout)}")
-        rollouts.extend(rollout)
+        logging.info(f"num augmentation rollouts: {len(rollout)}")
+        augmentation_rollouts.extend(rollout)
 
     obs_data = []
     obs_tp1_data = []
@@ -139,8 +145,10 @@ def load_pkl_dataset(
         len(rollouts), min(len(rollouts), num_trajs), replace=False
     )
     rollouts = [rollouts[i] for i in traj_indices.tolist()]
+    logging.info(f"number of selected rollouts base: {len(rollouts)}")
 
-    logging.info(f"number of selected rollouts: {len(rollouts)}")
+    # add augmentation data
+    rollouts.extend(augmentation_rollouts)
 
     for rollout in rollouts:
         obs = [step[0] for step in rollout]

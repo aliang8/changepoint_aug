@@ -28,6 +28,9 @@ def get_config():
     config.policy_cls = "mlp"
     config.num_policies = 5
 
+    # influence functions
+    config.inf_fn_lambda = 1e-2
+
     config.density_exp_name = "i006_cvae"
     config.density_model_ckpt = "nt-200"
     config.density_ckpt_step = 950
