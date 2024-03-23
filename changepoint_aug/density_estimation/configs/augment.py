@@ -6,10 +6,16 @@ def get_config():
     config = get_base_config()
     config.exp_name = "augment"
 
-    config.top_k = 2
+    config.top_k = 1
     config.selection_metric = "policy_variance"
+    config.selection = "per_traj"  # global
+    # config.selection = "global"
+
+    config.total_num_states = 100
     # reweight metric using density estimation
     config.reweight_with_density = False
+    config.lamb = 1.3  # reweighing hyperparameter
+    config.visualize = False
 
     # vae
     config.cond_dim = 2
@@ -34,9 +40,10 @@ def get_config():
     config.ckpt_step = 180
 
     # number of expert steps per state
+    config.num_augmentations_per_state = 2
     config.num_expert_steps_aug = 10
-    config.num_perturb_steps = 0
-    config.max_states_visualize = 10
+    config.num_perturb_steps = 2
+    config.max_states_visualize = 5
 
-    config.augment_data_file = f"augment_dataset_aug-{config.num_expert_steps_aug}_m-{config.selection_metric}.pkl"
+    config.augment_data_file = ""
     return config

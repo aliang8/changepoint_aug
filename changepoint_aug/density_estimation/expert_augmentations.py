@@ -43,14 +43,40 @@ os.environ["MUJOCO_EGL"] = "egl"
 
 _CONFIG = config_flags.DEFINE_config_file("config")
 
+shorthands = {
+    "num_expert_steps_aug": "nes",
+    "num_augmentations_per_state": "nap",
+    "num_perturb_steps": "nps",
+    "selection_metric": "selm",
+    "selection": "sel",
+    "lamb": "lam",
+    "reweight_with_density": "rwd",
+    "total_num_states": "tns",
+}
 
-def postprocess_density(densities):
+
+def create_aug_filename(config):
+    filename = "augment_dataset"
+    for key, value in config.items():
+        if key in shorthands:
+            key = shorthands[key]
+            filename += f"_{key}-{value}"
+    filename += ".pkl"
+    return filename
+
+
+def postprocess_density(densities, lamb=1.0):
     """
     Postprocess density estimates to be between 0 and 1
     """
-    densities = densities - np.min(densities)
+    # densities represent logprobs
+    densities = np.exp(densities)
+
+    # rescale to be between 0 and 1
     densities = densities / np.max(densities)
-    densities *= 2
+
+    # either multiply or raise to some power
+    densities = densities**lamb
 
     # should i also apply a smoothing kernel?
     densities = np.convolve(densities, np.ones(5) / 5, mode="same")
@@ -91,6 +117,7 @@ class QueryStateSelector:
             print(f"density model ckpt path: {density_model_ckpt_path}")
 
             config.load_from_ckpt = str(density_model_ckpt_path)
+            self.density_model_ckpt_path = density_model_ckpt_path
             self.density_ts = create_ts_cvae(config, 2, None)
         else:
             self.density_ts = None
@@ -105,6 +132,7 @@ class QueryStateSelector:
             / config.ckpt_dir
             / f"epoch_{config.ckpt_step}.pkl"
         )
+        self.model_ckpt_path = model_ckpt_path
 
         obs_dim = self.obss.shape[-1]
         action_dim = self.actions.shape[-1]
@@ -119,53 +147,57 @@ class QueryStateSelector:
         logging.info(f"model ckpt path: {model_ckpt_path}")
         print(f"model ckpt path: {model_ckpt_path}")
 
-    def select_states(self, env=None):
-        """
-        Handles computation of the metric and reranking states based on metric.
-        """
-
-        # STEP 1: compute density for every obss and corresponding goal
-        # STEP 2: compute metric for every obss
-        # STEP 3: reweigh metric by density (optional)
-        # STEP 4: select top k states
-
         start_indices = np.where(self.dones)[0]
         start_indices += 1
-        start_indices = np.insert(start_indices, 0, 0)
-        # start_indices = start_indices[:-1]
+        self.start_indices = np.insert(start_indices, 0, 0)
 
         if self.config.reweight_with_density:
-            logging.info(f"computing density estimates")
-            density_estimates = []
-
-            chunk_size = 1000
-            rng_keys = jax.random.split(self.rng_key, self.obss.shape[0] + 1)
-            self.rng_key = rng_keys[0]
-            obss_chunked = np.array_split(self.obss, self.obss.shape[0] // chunk_size)
-            rng_keys_chunked = np.array_split(
-                rng_keys[1:], self.obss.shape[0] // chunk_size
+            self.density_estimates = self.compute_density_estimates()
+            self.density_estimates = postprocess_density(
+                self.density_estimates, self.config.lamb
             )
 
-            # STEP 1
-            density_estimates = []
-            for indx, chunk_obs in enumerate(obss_chunked):
-                density = jax.vmap(
-                    lambda obs, key: estimate_density(
-                        self.density_ts,
-                        key,
-                        obs=obs[:2],  # xy location
-                        goal=obs[4:6],  # goal
-                        kl_div_weight=0.0,
-                        num_posterior_samples=self.config.num_posterior_samples,
-                    )
-                )(chunk_obs, rng_keys_chunked[indx])
+        # compute metric
+        self.metric = self.compute_metric()
+        self.reweighted_metric = self.metric * self.density_estimates
 
-                density_estimates.append(density)
+    def compute_density_estimates(self):
+        """
+        Compute density estimates for the entire dataset
+        """
+        logging.info(f"computing density estimates")
+        density_estimates = []
 
-            density_estimates = np.concatenate(density_estimates)
-            logging.info(f"done computing density estimates, {density_estimates.shape}")
+        chunk_size = 1000
+        rng_keys = jax.random.split(self.rng_key, self.obss.shape[0] + 1)
+        self.rng_key = rng_keys[0]
+        obss_chunked = np.array_split(self.obss, self.obss.shape[0] // chunk_size)
+        rng_keys_chunked = np.array_split(
+            rng_keys[1:], self.obss.shape[0] // chunk_size
+        )
 
-        # STEP 2
+        density_estimates = []
+        for indx, chunk_obs in enumerate(obss_chunked):
+            density = jax.vmap(
+                lambda obs, key: estimate_density(
+                    self.density_ts,
+                    key,
+                    obs=obs[:2],  # xy location
+                    goal=obs[4:6],  # goal
+                    kl_div_weight=0.0,
+                    num_posterior_samples=self.config.num_posterior_samples,
+                )
+            )(chunk_obs, rng_keys_chunked[indx])
+
+            density_estimates.append(density)
+
+        density_estimates = np.concatenate(density_estimates)
+        logging.info(f"done computing density estimates, {density_estimates.shape}")
+
+        return density_estimates
+
+    def compute_metric(self):
+        metric = None
         if self.metric == "q_variance":
             pass
         elif self.metric == "policy_variance":
@@ -175,7 +207,7 @@ class QueryStateSelector:
             )
             self.rng_key = policy_rng_keys[0]
             action_preds = jax.vmap(
-                lambda param, rng_key: self.ts.apply_fn(param, self.rng_key, self.obss)
+                lambda param, rng_key: self.ts.apply_fn(param, rng_key, self.obss)
             )(self.ts.params, policy_rng_keys[1:])
 
             # compute variance between ensemble
@@ -183,57 +215,21 @@ class QueryStateSelector:
             metric = jnp.var(action_preds, axis=0).sum(axis=-1)
             logging.info(f"done computing policy variance, {metric.shape}")
 
-        # STEP 3
+        return metric
 
-        # iterate over each trajectory and reweigh the metric
-        reweighted_metrics = []
-
-        selected_states = []
-        selected_indices = []
-        selected_state_traj_indx = []
-
-        for traj_indx in tqdm.tqdm(range(len(start_indices) - 1)):
-            start = start_indices[traj_indx]
-            end = start_indices[traj_indx + 1]
-            metric_ = metric[start:end]
-
-            # pick indx with max reweighted metric
-            if self.config.reweight_with_density:
-                densities = density_estimates[start:end]
-                densities = postprocess_density(densities)
-                reweighted_metric = metric_ * densities
-                reweighted_metrics.extend(reweighted_metric)
-
-                selected_indx = np.argpartition(reweighted_metric, -self.config.top_k)[
-                    -self.config.top_k :
-                ]
-                # import ipdb
-
-                # ipdb.set_trace()
-            else:
-                selected_indx = np.argpartition(metric_, -self.config.top_k)[
-                    -self.config.top_k :
-                ]
-
-            selected_states.append(np.take(self.obss[start:end], selected_indx, axis=0))
-            selected_indices.extend(selected_indx)
-            selected_state_traj_indx.extend([traj_indx] * selected_indx.shape[0])
-
-        selected_states = np.concatenate(selected_states)
-        logging.info(f"number of selected states: {len(selected_indices)}")
-
-        # STEP 4
-        # TODO: maybe edit to select global top k states
-
+    def visualize_selected_states(
+        self, selected_indices, selected_state_traj_indx, env=None
+    ):
         num_states = len(selected_indices)
         num_rows_per_fig = self.config.max_states_visualize
+        selected_states = self.obss[selected_indices]
 
         # chunk the selected states
         selected_states_chunk = np.array_split(
-            selected_states, num_states // num_rows_per_fig
+            selected_states, num_states // (num_rows_per_fig * 2)
         )
         selected_state_traj_indx_chunk = np.array_split(
-            selected_state_traj_indx, num_states // num_rows_per_fig
+            selected_state_traj_indx, num_states // (num_rows_per_fig * 2)
         )
 
         for chunk_indx, chunk in tqdm.tqdm(enumerate(selected_states_chunk)):
@@ -245,6 +241,10 @@ class QueryStateSelector:
 
             # visualized selected states to augment
             imgs = np.array(imgs)
+
+            # import ipdb
+
+            # ipdb.set_trace()
 
             # img, trajectory, metric, density if available
             n_plots_p_img = self.config.top_k * 2 + 1
@@ -279,12 +279,12 @@ class QueryStateSelector:
                 traj_indx = selected_state_traj_indx_chunk[chunk_indx][
                     indx * self.config.top_k
                 ]
-                start = start_indices[traj_indx]
-                end = start_indices[traj_indx + 1]
+                start = self.start_indices[traj_indx]
+                end = self.start_indices[traj_indx + 1]
                 traj = self.obss[start:end]
 
-                metric_ = metric[start:end]
-                reweighted_metric_ = np.array(reweighted_metrics[start:end])
+                metric_ = self.metric[start:end]
+                reweighted_metric_ = np.array(self.reweighted_metric[start:end])
 
                 ax1.set_xlim(min_x, max_x)
                 ax1.set_ylim(min_y, max_y)
@@ -349,8 +349,8 @@ class QueryStateSelector:
                 if self.config.reweight_with_density:
                     ax3 = axs_flat[row * n_plots_p_img + self.config.top_k * 2 + 1]
                     # plot density metric
-                    densities = density_estimates[start:end]
-                    densities = postprocess_density(densities)
+                    densities = self.density_estimates[start:end]
+                    densities = postprocess_density(densities, self.config.lamb)
                     ax3.plot(densities, label="density", color="g")
 
             col_names = (
@@ -375,7 +375,57 @@ class QueryStateSelector:
             # save figure
             plt.savefig(f"selected_states_{chunk_indx}.png")
 
-        return selected_states
+    def select_states_per_traj(self):
+        """
+        Handles computation of the metric and reranking states based on metric.
+        """
+        # iterate over each trajectory and reweigh the metric
+        selected_indices = []
+        selected_state_traj_indx = []
+
+        # pick top k states per trajectory
+        for traj_indx in tqdm.tqdm(range(len(self.start_indices) - 1)):
+            start = self.start_indices[traj_indx]
+            end = self.start_indices[traj_indx + 1]
+            if self.config.reweight_with_density:
+                metric = self.reweighted_metric[start:end]
+            else:
+                metric = self.metric[start:end]
+
+            selected_indx = np.argpartition(metric, -self.config.top_k)[
+                -self.config.top_k :
+            ][::-1]
+            selected_indx += start
+            selected_indices.extend(selected_indx)
+            selected_state_traj_indx.extend([traj_indx] * selected_indx.shape[0])
+
+        return selected_indices, selected_state_traj_indx
+
+    def select_states_global(self):
+        """
+        Handles computation of the metric and reranking states based on metric.
+        """
+        assert self.config.top_k == 1
+
+        if self.config.reweight_with_density:
+            metric = self.reweighted_metric
+        else:
+            metric = self.metric
+
+        selected_indices = np.argpartition(metric, -self.config.total_num_states)[
+            -self.config.total_num_states :
+        ][::-1]
+
+        # figure out which traj each selected indx belongs to
+        selected_state_traj_indx = []
+        for indx in selected_indices:
+            for traj_indx in range(len(self.start_indices) - 1):
+                start = self.start_indices[traj_indx]
+                end = self.start_indices[traj_indx + 1]
+                if start <= indx < end:
+                    selected_state_traj_indx.append(traj_indx)
+                    break
+        return selected_indices, selected_state_traj_indx
 
 
 def run_augmentation(config, dataset, wandb_run=None):
@@ -397,57 +447,84 @@ def run_augmentation(config, dataset, wandb_run=None):
     # STEP 2: Query states to augment
     # pick which states to query based on metric
     selector = QueryStateSelector(config, dataset, wandb_run=wandb_run)
-    selected_states = selector.select_states(env)
-    selected_states = selected_states[:100]
+
+    if config.selection == "per_traj":
+        selected_indices, selected_state_traj_indx = selector.select_states_per_traj()
+    elif config.selection == "global":
+        selected_indices, selected_state_traj_indx = selector.select_states_global()
+
+    logging.info(f"number of selected states: {len(selected_indices)}")
+
+    if config.visualize:
+        selector.visualize_selected_states(
+            selected_indices, selected_state_traj_indx, env
+        )
 
     # STEP 3: Augment selected states with a few steps of expert actions
     # Perturb states a little bit
 
     # load expert model
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # state_dict = torch.load(
-    #     "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_rand_1000000.pt",
-    #     map_location=device,
-    # )
-    # envs = gym.vector.SyncVectorEnv([make_env_sac(None, 0, 0, False, "")])
-    # actor = Actor(envs).to(device)
-    # actor.load_state_dict(state_dict["actor"])
-    # actor.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    state_dict = torch.load(
+        "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_5M.pt",
+        map_location=device,
+    )
+    envs = gym.vector.SyncVectorEnv([make_env_sac(None, 0, 0, False, "")])
+    actor = Actor(envs).to(device)
+    actor.load_state_dict(state_dict["actor"])
+    actor.eval()
 
-    # rollouts = []
+    rollouts = []
 
-    # for state in tqdm.tqdm(selected_states):
-    #     obs, _ = env.reset_to_state(state)
+    selected_states = selector.obss[selected_indices]
 
-    #     # take some perturbation steps
-    #     for _ in range(config.num_perturb_steps):
-    #         action = env.action_space.sample()
-    #         next_obs, reward, done, truncated, info = env.step(action)
-    #         obs = next_obs
+    # total number of new transitions = (# augmentations per state) x (# num total trajs) x (# expert steps)
+    for state in tqdm.tqdm(selected_states):
 
-    #     obs_input = np.concatenate(
-    #         [obs["observation"], obs["desired_goal"], obs["meta"]],
-    #     )
-    #     obs_input = obs_input[None]
+        for _ in range(config.num_augmentations_per_state):
+            obs, _ = env.reset_to_state(state)
 
-    #     for _ in range(config.num_expert_steps_aug):
-    #         # don't use the sampled action
-    #         action_sample, _, action_mean = actor.get_action(
-    #             torch.Tensor(obs_input).to(device)
-    #         )
-    #         action = action_mean[0].detach().cpu().numpy()
-    #         next_obs, reward, done, truncated, info = env.step(action)
-    #         rollouts.append((obs, next_obs, action, reward, done, truncated, info))
+            # take some perturbation steps
+            for _ in range(config.num_perturb_steps):
+                action = env.action_space.sample()
+                next_obs, reward, done, truncated, info = env.step(action)
+                obs = next_obs
 
-    #         obs = next_obs
+            obs_input = np.concatenate(
+                [obs["observation"], obs["desired_goal"], obs["meta"]],
+            )
+            obs_input = obs_input[None]
 
-    # logging.info(f"number of new transitions: {len(rollouts)}")
+            for _ in range(config.num_expert_steps_aug):
+                # don't use the sampled action
+                action_sample, _, action_mean = actor.get_action(
+                    torch.Tensor(obs_input).to(device)
+                )
+                action = action_mean[0].detach().cpu().numpy()
+                next_obs, reward, done, truncated, info = env.step(action)
+                rollouts.append((obs, next_obs, action, reward, done, truncated, info))
 
-    # # STEP 4: Save augmented dataset
-    # save_file = Path(config.data_dir) / config.augment_data_file
-    # logging.info(f"Saving augmented dataset to {save_file}")
-    # with open(save_file, "wb") as f:
-    #     pickle.dump(rollouts, f)
+                obs = next_obs
+
+    logging.info(f"number of new transitions: {len(rollouts)}")
+
+    # STEP 4: Save augmented dataset
+    augment_data_file = create_aug_filename(config)
+    save_file = Path(config.data_dir) / augment_data_file
+    logging.info(f"Saving augmented dataset to {save_file}")
+    with open(save_file, "wb") as f:
+        pickle.dump(
+            {
+                "rollouts": rollouts,
+                "metadata": {
+                    "density_model_ckpt_path": selector.density_model_ckpt_path,
+                    "model_ckpt_path": selector.model_ckpt_path,
+                    "num_transitions": len(rollouts),
+                    "config": config.to_dict(),
+                },
+            },
+            f,
+        )
 
     env.close()
 
