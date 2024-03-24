@@ -112,9 +112,6 @@ class BaseTrainer:
             # run a test first
             if epoch % self.config.test_interval == 0:
                 test_metrics = self.test(epoch)
-                test_metrics = {f"test/{k}": v for k, v in test_metrics.items()}
-                if self.wandb_run is not None:
-                    self.wandb_run.log(test_metrics)
 
                 # save based on key
                 if self.config.save_key in test_metrics:
@@ -133,6 +130,15 @@ class BaseTrainer:
                         )
                         with open(ckpt_file, "wb") as f:
                             pickle.dump(self.ts.params, f)
+
+                        # create a file with the best metric in the name, use a placeholder
+                        best_ckpt_file = self.ckpt_dir / "best.txt"
+                        with open(best_ckpt_file, "w") as f:
+                            f.write(f"{epoch}, {test_metrics[key]}")
+
+                test_metrics = {f"test/{k}": v for k, v in test_metrics.items()}
+                if self.wandb_run is not None:
+                    self.wandb_run.log(test_metrics)
 
             for batch in self.train_loader:
                 train_metrics = self.train_step(batch)

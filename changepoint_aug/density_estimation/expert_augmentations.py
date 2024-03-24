@@ -100,6 +100,8 @@ def compute_influence_scores(jacs, residuals, lam):
     G = jax.vmap(lambda j: j.T @ j)(jacs)
     G = jnp.sum(G, axis=0)
 
+    # TODO: maybe increase lambda
+
     # evals = jnp.linalg.eigvalsh(G)
     # # first, we fix the negative eigenvalues
     # lam = jnp.max(jnp.where(evals < 0, -evals, 0.0))
@@ -163,6 +165,7 @@ class QueryStateSelector:
             self.density_model_ckpt_path = density_model_ckpt_path
             self.density_ts = create_ts_cvae(config, 2, None)
         else:
+            self.density_model_ckpt_path = ""
             self.density_ts = None
 
         # load metric for computing metric for measuring
@@ -204,8 +207,9 @@ class QueryStateSelector:
             )
 
         # compute metric
-        self.selection_metric = self.compute_metric()
-        self.reweighted_metric = self.selection_metric * self.density_estimates
+        self.metric = self.compute_metric()
+        if self.config.reweight_with_density:
+            self.reweighted_metric = self.metric * self.density_estimates
 
     def compute_density_estimates(self):
         """
@@ -387,7 +391,7 @@ class QueryStateSelector:
                 end = self.start_indices[traj_indx + 1]
                 traj = self.obss[start:end]
 
-                metric_ = self.selection_metric[start:end]
+                metric_ = self.metric[start:end]
                 reweighted_metric_ = np.array(self.reweighted_metric[start:end])
 
                 ax1.set_xlim(min_x, max_x)
@@ -491,10 +495,18 @@ class QueryStateSelector:
         for traj_indx in tqdm.tqdm(range(len(self.start_indices) - 1)):
             start = self.start_indices[traj_indx]
             end = self.start_indices[traj_indx + 1]
+
             if self.config.reweight_with_density:
                 metric = self.reweighted_metric[start:end]
             else:
-                metric = self.selection_metric[start:end]
+                metric = self.metric[start:end]
+
+            # skip if metric is below threshold
+            if (
+                self.selection_metric == "influence_function"
+                and np.max(metric) < self.config.metric_threshold
+            ):
+                continue
 
             selected_indx = np.argpartition(metric, -self.config.top_k)[
                 -self.config.top_k :
@@ -514,7 +526,7 @@ class QueryStateSelector:
         if self.config.reweight_with_density:
             metric = self.reweighted_metric
         else:
-            metric = self.selection_metric
+            metric = self.metric
 
         selected_indices = np.argpartition(metric, -self.config.total_num_states)[
             -self.config.total_num_states :
@@ -564,71 +576,70 @@ def run_augmentation(config, dataset, wandb_run=None):
             selected_indices, selected_state_traj_indx, env
         )
 
-    # # STEP 3: Augment selected states with a few steps of expert actions
-    # # Perturb states a little bit
+    # STEP 3: Augment selected states with a few steps of expert actions
+    # Perturb states a little bit
 
-    # # load expert model
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # state_dict = torch.load(
-    #     "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_5M.pt",
-    #     map_location=device,
-    # )
-    # envs = gym.vector.SyncVectorEnv([make_env_sac(None, 0, 0, False, "")])
-    # actor = Actor(envs).to(device)
-    # actor.load_state_dict(state_dict["actor"])
-    # actor.eval()
+    # load expert model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    state_dict = torch.load(
+        "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_5M.pt",
+        map_location=device,
+    )
+    envs = gym.vector.SyncVectorEnv([make_env_sac(None, 0, 0, False, "")])
+    actor = Actor(envs).to(device)
+    actor.load_state_dict(state_dict["actor"])
+    actor.eval()
 
-    # rollouts = []
+    rollouts = []
 
-    # selected_states = selector.obss[selected_indices]
+    selected_states = selector.obss[selected_indices]
 
-    # # total number of new transitions = (# augmentations per state) x (# num total trajs) x (# expert steps)
-    # for state in tqdm.tqdm(selected_states):
+    # total number of new transitions = (# augmentations per state) x (# num total trajs) x (# expert steps)
+    for state in tqdm.tqdm(selected_states):
 
-    #     for _ in range(config.num_augmentations_per_state):
-    #         obs, _ = env.reset_to_state(state)
+        for _ in range(config.num_augmentations_per_state):
+            obs, _ = env.reset_to_state(state)
 
-    #         # take some perturbation steps
-    #         for _ in range(config.num_perturb_steps):
-    #             action = env.action_space.sample()
-    #             next_obs, reward, done, truncated, info = env.step(action)
-    #             obs = next_obs
+            # take some perturbation steps
+            for _ in range(config.num_perturb_steps):
+                action = env.action_space.sample()
+                next_obs, reward, done, truncated, info = env.step(action)
+                obs = next_obs
 
-    #         obs_input = np.concatenate(
-    #             [obs["observation"], obs["desired_goal"], obs["meta"]],
-    #         )
-    #         obs_input = obs_input[None]
+            for _ in range(config.num_expert_steps_aug):
+                obs_input = np.concatenate(
+                    [obs["observation"], obs["desired_goal"], obs["meta"]],
+                )
+                obs_input = obs_input[None]
+                # don't use the sampled action
+                action_sample, _, action_mean = actor.get_action(
+                    torch.Tensor(obs_input).to(device)
+                )
+                action = action_mean[0].detach().cpu().numpy()
+                next_obs, reward, done, truncated, info = env.step(action)
+                rollouts.append((obs, next_obs, action, reward, done, truncated, info))
 
-    #         for _ in range(config.num_expert_steps_aug):
-    #             # don't use the sampled action
-    #             action_sample, _, action_mean = actor.get_action(
-    #                 torch.Tensor(obs_input).to(device)
-    #             )
-    #             action = action_mean[0].detach().cpu().numpy()
-    #             next_obs, reward, done, truncated, info = env.step(action)
-    #             rollouts.append((obs, next_obs, action, reward, done, truncated, info))
+                obs = next_obs
 
-    #             obs = next_obs
+    logging.info(f"number of new transitions: {len(rollouts)}")
 
-    # logging.info(f"number of new transitions: {len(rollouts)}")
-
-    # # STEP 4: Save augmented dataset
-    # augment_data_file = create_aug_filename(config)
-    # save_file = Path(config.data_dir) / augment_data_file
-    # logging.info(f"Saving augmented dataset to {save_file}")
-    # with open(save_file, "wb") as f:
-    #     pickle.dump(
-    #         {
-    #             "rollouts": rollouts,
-    #             "metadata": {
-    #                 "density_model_ckpt_path": selector.density_model_ckpt_path,
-    #                 "model_ckpt_path": selector.model_ckpt_path,
-    #                 "num_transitions": len(rollouts),
-    #                 "config": config.to_dict(),
-    #             },
-    #         },
-    #         f,
-    #     )
+    # STEP 4: Save augmented dataset
+    augment_data_file = create_aug_filename(config)
+    save_file = Path(config.data_dir) / augment_data_file
+    logging.info(f"Saving augmented dataset to {save_file}")
+    with open(save_file, "wb") as f:
+        pickle.dump(
+            {
+                "rollouts": rollouts,
+                "metadata": {
+                    "density_model_ckpt_path": selector.density_model_ckpt_path,
+                    "model_ckpt_path": selector.model_ckpt_path,
+                    "num_transitions": len(rollouts),
+                    "config": config.to_dict(),
+                },
+            },
+            f,
+        )
 
     env.close()
 

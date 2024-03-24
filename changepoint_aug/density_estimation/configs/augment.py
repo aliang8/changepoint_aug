@@ -16,6 +16,17 @@ def get_config():
     config.reweight_with_density = False
     config.lamb = 1.3  # reweighing hyperparameter
     config.visualize = False
+    config.metric_threshold = (
+        10  # threshold for metric, only sample states with metric > threshold
+    )
+
+    # number of augmentations for each sampled state
+    config.num_augmentations_per_state = 2
+    # number of expert steps per state
+    config.num_expert_steps_aug = 10
+    # number of random steps to take to perturb state
+    config.num_perturb_steps = 2
+    config.max_states_visualize = 5
 
     # vae
     config.cond_dim = 2
@@ -31,22 +42,17 @@ def get_config():
     # influence functions
     config.inf_fn_lambda = 1e-2
 
+    # for loading model to compute the density
     config.density_exp_name = "i006_cvae"
     config.density_model_ckpt = "nt-200"
     config.density_ckpt_step = 950
 
+    # for loading model to compute the heuristic
     # config.exp_name = "i002_q_sarsa"
     # config.model_ckpt = "nt-25_s-0"
     config.exp_name = "i005_bc_200"
     config.model_ckpt = "nt-100_s-0"
-
     config.ckpt_step = 180
-
-    # number of expert steps per state
-    config.num_augmentations_per_state = 2
-    config.num_expert_steps_aug = 10
-    config.num_perturb_steps = 2
-    config.max_states_visualize = 5
 
     config.augment_data_file = ""
     return config
