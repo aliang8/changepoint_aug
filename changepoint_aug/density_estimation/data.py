@@ -92,6 +92,7 @@ def load_pkl_dataset(
     train_perc: float = 1.0,
     env: str = "MAZE",
     augmentation_data_files: List[str] = [],
+    num_augmentation_steps: int = 0,
 ):
     data_file = Path(data_dir) / data_file
     with open(data_file, "rb") as f:
@@ -121,15 +122,16 @@ def load_pkl_dataset(
     augmentation_rollouts = []
     for data_file in augmentation_data_files:
         logging.info(f"loading augmentation file: {data_file}")
-        data_file = Path(data_dir) / data_file
+        data_file = Path(data_dir) / "augment_datasets" / data_file
         with open(data_file, "rb") as f:
             data = pickle.load(f)
 
         metadata = data["metadata"]
         data = data["rollouts"]
+        steps = metadata["config"]["num_expert_steps_aug"]
 
         # split data into list
-        rollout = [data[i : i + 10] for i in range(0, len(data), 10)]
+        rollout = [data[i : i + steps] for i in range(0, len(data), steps)]
         logging.info(f"num augmentation rollouts: {len(rollout)}")
         augmentation_rollouts.extend(rollout)
 
@@ -139,16 +141,35 @@ def load_pkl_dataset(
     action_tp1_data = []
     rew_data = []
     done_data = []
+    info_data = []
 
     # select subset of random trajectories
     traj_indices = np.random.choice(
         len(rollouts), min(len(rollouts), num_trajs), replace=False
     )
     rollouts = [rollouts[i] for i in traj_indices.tolist()]
+    # print(traj_indices.tolist())
     logging.info(f"number of selected rollouts base: {len(rollouts)}")
 
-    # add augmentation data
-    rollouts.extend(augmentation_rollouts)
+    if len(augmentation_rollouts) > 0:
+        # add augmentation data
+        # subsample augmentation rollouts to be num_augmentation_steps
+        num_aug_trajs = int(num_augmentation_steps // len(augmentation_rollouts[0]))
+        logging.info(f"number of augmentation trajectories to use: {num_aug_trajs}")
+
+        aug_traj_indices = np.random.choice(
+            len(augmentation_rollouts),
+            min(len(augmentation_rollouts), num_aug_trajs),
+            replace=False,
+        )
+        augmentation_rollouts = [
+            augmentation_rollouts[i] for i in aug_traj_indices.tolist()
+        ]
+        logging.info(
+            f"actual number of augmentation trajectories to use: {num_aug_trajs}"
+        )
+
+        rollouts.extend(augmentation_rollouts)
 
     for rollout in rollouts:
         obs = [step[0] for step in rollout]
@@ -165,6 +186,7 @@ def load_pkl_dataset(
                 obs = [
                     np.concatenate((o["observation"], o["desired_goal"])) for o in obs
                 ]
+
         obs_data.extend(obs[:-1])
         obs_tp1_data.extend(obs[1:])
         action_data.extend([step[2] for step in rollout][:-1])
@@ -173,6 +195,7 @@ def load_pkl_dataset(
         done[-1] = True
         done_data.extend(done)
         rew_data.extend([step[3] for step in rollout][1:])
+        info_data.extend([step[-1] for step in rollout])
 
     # convert to torch tensors
     obs_data = torch.from_numpy(np.array(obs_data)).squeeze()
@@ -225,7 +248,6 @@ def load_pkl_dataset(
 
     batch = next(iter(train_dataloader))
     logging.info(batch[0][0])
-
     # import ipdb
 
     # ipdb.set_trace()
@@ -239,4 +261,5 @@ def load_pkl_dataset(
         test_dataloader,
         obs_data.shape[-1],
         action_data.shape[-1],
+        info_data,
     )

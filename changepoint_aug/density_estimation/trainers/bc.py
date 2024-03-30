@@ -77,10 +77,11 @@ class BCTrainer(BaseTrainer):
             actions = jnp.repeat(actions[None], self.config.num_policies, axis=0)
             bc_loss = optax.squared_error(action_pred, actions).mean()
         elif self.config.policy_cls == "gaussian":
-            _, _, mean, stddev = jax.vmap(
+            mean, logvar = jax.vmap(
                 lambda param, rng_key: ts.apply_fn(param, rng_key, obss)
             )(params, policy_rng_keys[1:])
 
+            stddev = jnp.exp(logvar) ** 0.5
             action_dist = dist.Normal(mean, stddev)
             logp = action_dist.log_prob(actions)
             logp = logp.sum(axis=-1).mean()
@@ -121,7 +122,7 @@ class BCTrainer(BaseTrainer):
             avg_test_metrics[k] /= len(self.test_loader)
 
         # run rollouts to test trained policy
-        rollouts, rollout_metrics = utils.run_rollouts(
+        eval_rollouts, rollout_metrics = utils.run_rollouts(
             self.ts,
             rng_key=next(self.rng_seq),
             config=self.config,
@@ -131,6 +132,11 @@ class BCTrainer(BaseTrainer):
         if self.wandb_run:
             rollout_metrics = {f"rollout/{k}": v for k, v in rollout_metrics.items()}
             self.wandb_run.log(rollout_metrics)
+
+        # save the trajectories to file
+        metadata_file = self.log_dir / f"eval_rollouts_{epoch}.pkl"
+        with open(metadata_file, "wb") as f:
+            pickle.dump(eval_rollouts, f)
 
         # visualize
         # visualize variance over policy ensemble for random trajectory

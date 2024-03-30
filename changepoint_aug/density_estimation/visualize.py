@@ -16,11 +16,25 @@ def visualize_policy_var(ts, rng_key, config, obss, goal):
     axes = axes.flatten()
 
     policy_rng_keys = jax.random.split(rng_key, config.num_policies + 1)
-    action_preds = jax.vmap(lambda param, rng_key: ts.apply_fn(param, rng_key, obss))(
-        ts.params, policy_rng_keys[1:]
-    )
-    # compute variance between ensemble
-    variance = jnp.var(action_preds, axis=0)
+    if config.policy_cls == "mlp":
+        action_preds = jax.vmap(
+            lambda param, rng_key: ts.apply_fn(param, rng_key, obss)
+        )(ts.params, policy_rng_keys[1:])
+
+        # compute variance between ensemble
+        variance = jnp.var(action_preds, axis=0)
+
+    else:
+        mean, logvar = jax.vmap(
+            lambda param, rng_key: ts.apply_fn(param, rng_key, obss)
+        )(ts.params, policy_rng_keys[1:])
+
+        # compute variance based on this https://arxiv.org/pdf/1612.01474.pdf
+        variance = jnp.exp(logvar)
+        ensemble_mean = jnp.mean(mean, axis=0)
+        variance = (variance + mean**2).sum(
+            axis=0
+        ) / config.num_policies - ensemble_mean**2
 
     # compute mean over action dimension
     variance = jnp.mean(variance, axis=-1)

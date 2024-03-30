@@ -39,29 +39,16 @@ psh = {
     "policy_cls": "pc",
     "num_policies": "np",
     "num_eval_episodes": "nee",
+    "num_augmentation_steps": "nas",
     "seed": "s",
     "kl_div_weight": "kl",
 }
 
 # run with ray tune
 param_space = {
-    # "latent_dim": tune.grid_search([5, 8]),
-    # "kl_div_weight": tune.grid_search([0.5, 1.0, 5.0]),
-    # "lr": tune.grid_search([1e-3, 1e-4]),
-    # "hidden_size": tune.grid_search([64, 128, 256]),
-    # "gamma": tune.grid_search([0.99, 0.9]),
-    "seed": tune.grid_search([0, 1, 2]),
-    # "data_file": tune.grid_search(["sac_maze_200.pkl"]),
-    # "num_trajs": tune.grid_search([5, 10, 25, 50, 75]),
-    # "num_trajs": tune.grid_search([100, 125, 150, 175, 200]),
-    "num_trajs": tune.grid_search([5, 10, 25, 50, 100, 125]),
+    "seed": tune.grid_search([0, 1, 2, 3, 4]),
+    "num_trajs": tune.grid_search([5, 10, 25, 50, 75]),
 }
-
-# param_space = {
-#     "seed": tune.grid_search([0]),
-#     "data_file": tune.grid_search(["sac_maze_100.pkl"]),
-#     "num_trajs": tune.grid_search([5]),
-# }
 
 
 def train_model_fn(config):
@@ -116,7 +103,7 @@ def main(_):
     if config["smoke_test"] is False:
         config["use_wb"] = True  # always log to wandb when we are running with ray tune
         config.update(param_space)
-        train_model = tune.with_resources(train_model_fn, {"cpu": 5, "gpu": 0.3})
+        train_model = tune.with_resources(train_model_fn, {"cpu": 5, "gpu": 0.1})
 
         run_config = RunConfig(
             name=config["exp_name"],

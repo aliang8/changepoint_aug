@@ -57,14 +57,19 @@ class BaseTrainer:
         # load dataset
         self.dataset, self.train_loader, self.test_loader = self.load_data()
 
+        self.root_dir = Path(self.config.root_dir)
+
         # setup log dirs
-        self.ckpt_dir = Path(self.config.root_dir) / self.config.ckpt_dir
+        self.ckpt_dir = self.root_dir / self.config.ckpt_dir
         logging.info(f"ckpt_dir: {self.ckpt_dir}")
 
         # make it
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.video_dir = Path(self.config.root_dir) / self.config.video_dir
+        self.video_dir = self.root_dir / self.config.video_dir
         self.video_dir.mkdir(parents=True, exist_ok=True)
+
+        self.log_dir = self.root_dir / "logs"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         if config.best_metric == "max":
             self.best_metric = float("-inf")
@@ -79,14 +84,17 @@ class BaseTrainer:
 
     def load_data(self):
         if self.config.env == "MAZE" or self.config.env == "MW":
-            dataset, train_loader, test_loader, obs_dim, action_dim = load_pkl_dataset(
-                self.config.data_dir,
-                self.config.data_file,
-                batch_size=self.config.batch_size,
-                num_trajs=self.config.num_trajs,
-                train_perc=self.config.train_perc,
-                env=self.config.env,
-                augmentation_data_files=self.config.augmentation_data_files,
+            dataset, train_loader, test_loader, obs_dim, action_dim, _ = (
+                load_pkl_dataset(
+                    self.config.data_dir,
+                    self.config.data_file,
+                    batch_size=self.config.batch_size,
+                    num_trajs=self.config.num_trajs,
+                    train_perc=self.config.train_perc,
+                    env=self.config.env,
+                    augmentation_data_files=self.config.augmentation_data_files,
+                    num_augmentation_steps=self.config.num_augmentation_steps,
+                )
             )
             self.obs_dim = obs_dim
             self.action_dim = action_dim
@@ -106,12 +114,17 @@ class BaseTrainer:
         return dataset, train_loader, test_loader
 
     def train(self):
+        # run one eval before training
+        test_metrics = self.test(0)
+
         for epoch in tqdm.tqdm(
-            range(self.config.num_epochs), disable=self.config.disable_tqdm
+            range(1, self.config.num_epochs + 1), disable=self.config.disable_tqdm
         ):
             # run a test first
             if epoch % self.config.test_interval == 0:
+                test_time = time.time()
                 test_metrics = self.test(epoch)
+                test_total_time = time.time() - test_time
 
                 # save based on key
                 if self.config.save_key in test_metrics:
@@ -139,15 +152,27 @@ class BaseTrainer:
                 test_metrics = {f"test/{k}": v for k, v in test_metrics.items()}
                 if self.wandb_run is not None:
                     self.wandb_run.log(test_metrics)
+                    self.wandb_run.log({"time/test_time": test_total_time})
 
+            epoch_time = time.time()
             for batch in self.train_loader:
+                batch_time = time.time()
                 train_metrics = self.train_step(batch)
+                batch_total_time = time.time() - batch_time
+
                 self.global_step += 1
 
                 if self.wandb_run is not None:
                     # add prefix to metrics
                     train_metrics = {f"train/{k}": v for k, v in train_metrics.items()}
                     self.wandb_run.log(train_metrics)
+                    self.wandb_run.log({"time/batch_time": batch_total_time})
+
+            epoch_total_time = time.time() - epoch_time
+
+            # log time information
+            if self.wandb_run is not None:
+                self.wandb_run.log({"time/epoch_time": epoch_total_time})
 
             # save model at set intervals
             if epoch % self.config.save_interval == 0:

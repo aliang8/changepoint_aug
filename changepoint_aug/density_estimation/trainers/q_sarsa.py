@@ -60,9 +60,7 @@ def create_ts(config, obs_dim, action_dim, rng_key):
 class QTrainer(BaseTrainer):
     def __init__(self, config: FrozenConfigDict):
         super().__init__(config)
-        self.ts = self.create_ts(
-            config, self.obs_dim, self.action_dim, next(self.rng_seq)
-        )
+        self.ts = create_ts(config, self.obs_dim, self.action_dim, next(self.rng_seq))
         self.jit_update_step = jax.jit(self.update_q_step)
 
     def td_loss_fn(

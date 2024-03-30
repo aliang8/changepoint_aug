@@ -15,13 +15,17 @@ def get_config():
     config.policy_cls = "mlp"
     config.num_trajs = 200
 
+    config.save_interval = 100
+    config.test_interval = 100
+    config.num_epochs = 1000
     config.num_eval_episodes = 50
 
+    # augmentation parameters
+    config.num_augmentation_steps = 1000
     # config.augmentation_data_files = [
-    #     "augment_dataset_lam-1.3_nap-1_nes-20_nps-2_rwd-True_sel-per_traj_selm-policy_variance_tns-100.pkl"
+    #     "augment_dataset_eid-MAZE_nes-10_nap-1_nps-1_selm-policy_variance_sel-per_traj_lam-1.3_rwd-False_tns-100.pkl"
     # ]
     config.augmentation_data_files = [
-        "augment_dataset_lam-1.3_nap-2_nes-50_nps-2_rwd-False_sel-per_traj_selm-influence_function_tns-100.pkl"
+        "augment_dataset_eid-MAZE_nes-20_nap-1_nps-2_selm-influence_function_sel-per_traj_lam-1.3_rwd-False_tns-100.pkl"
     ]
-
     return config

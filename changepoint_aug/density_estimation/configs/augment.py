@@ -21,12 +21,15 @@ def get_config():
     )
 
     # number of augmentations for each sampled state
-    config.num_augmentations_per_state = 2
+    config.num_augmentations_per_state = 1
     # number of expert steps per state
     config.num_expert_steps_aug = 10
     # number of random steps to take to perturb state
-    config.num_perturb_steps = 2
+    config.num_perturb_steps = 1
     config.max_states_visualize = 5
+
+    # for q-variance metric
+    config.num_samples_qvar = 100
 
     # vae
     config.cond_dim = 2
@@ -50,9 +53,13 @@ def get_config():
     # for loading model to compute the heuristic
     # config.exp_name = "i002_q_sarsa"
     # config.model_ckpt = "nt-25_s-0"
-    config.exp_name = "i005_bc_200"
+    config.exp_name = "i022_bc_base"
     config.model_ckpt = "nt-100_s-0"
-    config.ckpt_step = 180
+    config.ckpt_step = 900
+
+    config.oracle_model_ckpt_path = (
+        "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_5M.pt"
+    )
 
     config.augment_data_file = ""
     return config

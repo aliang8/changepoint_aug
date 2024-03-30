@@ -13,6 +13,8 @@ import torch
 import wandb
 import io
 import time
+import cv2
+import imageio
 from PIL import Image
 import jax.numpy as jnp
 import numpy as np
@@ -28,7 +30,10 @@ import jax.scipy as jsp
 
 sys.path.append("/scr/aliang80/changepoint_aug/changepoint_aug/old")
 from sac_torch import Actor
+from sac_torch_mw import Actor as ActorMW
+
 from sac_eval import make_env as make_env_sac
+from sac_eval_mw import make_env as make_env_sac_mw
 
 from changepoint_aug.density_estimation.data import load_pkl_dataset, make_blob_dataset
 from changepoint_aug.density_estimation.trainers.q_sarsa import create_ts as create_ts_q
@@ -45,6 +50,7 @@ os.environ["MUJOCO_EGL"] = "egl"
 _CONFIG = config_flags.DEFINE_config_file("config")
 
 shorthands = {
+    "env": "eid",
     "num_expert_steps_aug": "nes",
     "num_augmentations_per_state": "nap",
     "num_perturb_steps": "nps",
@@ -58,10 +64,9 @@ shorthands = {
 
 def create_aug_filename(config):
     filename = "augment_dataset"
-    for key, value in config.items():
-        if key in shorthands:
-            key = shorthands[key]
-            filename += f"_{key}-{value}"
+    for k, v in shorthands.items():
+        if hasattr(config, k):
+            filename += f"_{v}-{getattr(config, k)}"
     filename += ".pkl"
     return filename
 
@@ -248,8 +253,38 @@ class QueryStateSelector:
 
     def compute_metric(self):
         metric = None
+        start = time.time()
         if self.selection_metric == "q_variance":
-            pass
+            logging.info(f"computing q variance")
+            rng_keys = jax.random.split(self.rng_key, self.obss.shape[0] + 1)
+            self.rng_key = rng_keys[0]
+            q_rng_keys = rng_keys[1:]
+
+            def apply_noise(params, rng_key, state, action):
+                noise_samples = jax.random.uniform(
+                    rng_key,
+                    (self.config.num_samples_qvar, action.shape[-1]),
+                    minval=-0.1,
+                    maxval=0.1,
+                )
+                q = jax.vmap(
+                    lambda noise: self.ts.apply_fn(params, state, action + noise)
+                )(noise_samples)
+                return q
+
+            def apply_action(params, states, actions):
+                q = jax.vmap(
+                    lambda state, rng_key, action: apply_noise(
+                        params, rng_key, state, action
+                    )
+                )(states, q_rng_keys, actions)
+                return q
+
+            q = apply_action(self.ts.params, self.obss, self.actions)
+            # [T, noise_samples]
+            q = jnp.squeeze(q, axis=-1)
+            metric = jnp.var(q, axis=1)
+
         elif self.selection_metric == "policy_variance":
             logging.info(f"computing policy variance")
             policy_rng_keys = jax.random.split(
@@ -263,7 +298,7 @@ class QueryStateSelector:
             # compute variance between ensemble
             # average over ensemble and sum over action dim
             metric = jnp.var(action_preds, axis=0).sum(axis=-1)
-            logging.info(f"done computing policy variance, {metric.shape}")
+
         elif self.selection_metric == "influence_function":
             # this depends on what we want to compute influence of point wrt to
 
@@ -293,8 +328,6 @@ class QueryStateSelector:
 
             logging.info("computing jacobians")
 
-            start = time.time()
-
             @jax.jit
             def func(carry, inputs):
                 inp, residual = inputs
@@ -321,7 +354,6 @@ class QueryStateSelector:
             logging.info(
                 f"done computing influence function, time taken: {time.time() - start}"
             )
-
         logging.info(f"metric max: {np.max(metric)}, min: {np.min(metric)}")
         return metric
 
@@ -488,7 +520,8 @@ class QueryStateSelector:
         Handles computation of the metric and reranking states based on metric.
         """
         # iterate over each trajectory and reweigh the metric
-        selected_indices = []
+        selected_indices_traj = []
+        selected_indices_global = []
         selected_state_traj_indx = []
 
         # pick top k states per trajectory
@@ -511,11 +544,12 @@ class QueryStateSelector:
             selected_indx = np.argpartition(metric, -self.config.top_k)[
                 -self.config.top_k :
             ][::-1]
+            selected_indices_traj.extend(selected_indx)
             selected_indx += start
-            selected_indices.extend(selected_indx)
+            selected_indices_global.extend(selected_indx)
             selected_state_traj_indx.extend([traj_indx] * selected_indx.shape[0])
 
-        return selected_indices, selected_state_traj_indx
+        return selected_indices_traj, selected_indices_global, selected_state_traj_indx
 
     def select_states_global(self):
         """
@@ -528,23 +562,27 @@ class QueryStateSelector:
         else:
             metric = self.metric
 
-        selected_indices = np.argpartition(metric, -self.config.total_num_states)[
-            -self.config.total_num_states :
-        ][::-1]
+        selected_indices_global = np.argpartition(
+            metric, -self.config.total_num_states
+        )[-self.config.total_num_states :][::-1]
 
         # figure out which traj each selected indx belongs to
         selected_state_traj_indx = []
-        for indx in selected_indices:
+        selected_indices_traj = []
+
+        for indx in selected_indices_global:
             for traj_indx in range(len(self.start_indices) - 1):
                 start = self.start_indices[traj_indx]
                 end = self.start_indices[traj_indx + 1]
                 if start <= indx < end:
                     selected_state_traj_indx.append(traj_indx)
+                    selected_indices_traj.append(indx - start)
                     break
-        return selected_indices, selected_state_traj_indx
+
+        return selected_indices_traj, selected_indices_global, selected_state_traj_indx
 
 
-def run_augmentation(config, dataset, wandb_run=None):
+def run_augmentation(config, dataset, infos, wandb_run=None):
     config = ConfigDict(config)
 
     # update the model ckpt based on config
@@ -555,6 +593,7 @@ def run_augmentation(config, dataset, wandb_run=None):
         config.env_id,
         config.seed,
         max_episode_steps=config.max_episode_steps,
+        freeze_rand_vec=False,
     )
     obs, _ = env.reset(seed=config.seed)
     # print(dataset[:][0][0])
@@ -565,16 +604,20 @@ def run_augmentation(config, dataset, wandb_run=None):
     selector = QueryStateSelector(config, dataset, wandb_run=wandb_run)
 
     if config.selection == "per_traj":
-        selected_indices, selected_state_traj_indx = selector.select_states_per_traj()
-    elif config.selection == "global":
-        selected_indices, selected_state_traj_indx = selector.select_states_global()
-
-    logging.info(f"number of selected states: {len(selected_indices)}")
-
-    if config.visualize:
-        selector.visualize_selected_states(
-            selected_indices, selected_state_traj_indx, env
+        selected_indices_traj, selected_indices_global, selected_state_traj_indx = (
+            selector.select_states_per_traj()
         )
+    elif config.selection == "global":
+        selected_indices_traj, selected_indices_global, selected_state_traj_indx = (
+            selector.select_states_global()
+        )
+
+    logging.info(f"number of selected states: {len(selected_indices_global)}")
+
+    # if config.visualize:
+    #     selector.visualize_selected_states(
+    #         selected_indices_global, selected_state_traj_indx, env
+    #     )
 
     # STEP 3: Augment selected states with a few steps of expert actions
     # Perturb states a little bit
@@ -582,23 +625,57 @@ def run_augmentation(config, dataset, wandb_run=None):
     # load expert model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     state_dict = torch.load(
-        "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_5M.pt",
+        config.oracle_model_ckpt_path,
         map_location=device,
     )
-    envs = gym.vector.SyncVectorEnv([make_env_sac(None, 0, 0, False, "")])
+    envs = gym.vector.SyncVectorEnv([make_env_sac(config.env_id, 0, 0, False, "")])
     actor = Actor(envs).to(device)
     actor.load_state_dict(state_dict["actor"])
     actor.eval()
 
     rollouts = []
 
-    selected_states = selector.obss[selected_indices]
+    selected_states = selector.obss[selected_indices_global]
+    selected_infos = [infos[ind] for ind in selected_indices_global]
+
+    # import ipdb
+
+    # ipdb.set_trace()
+
+    # save images and generate a video of the augmentation dataset
+    imgs = []
 
     # total number of new transitions = (# augmentations per state) x (# num total trajs) x (# expert steps)
-    for state in tqdm.tqdm(selected_states):
+    for indx, state in tqdm.tqdm(enumerate(selected_states)):
 
         for _ in range(config.num_augmentations_per_state):
-            obs, _ = env.reset_to_state(state)
+            if config.env == "MAZE":
+                obs, _ = env.reset_to_state(state)
+            elif config.env == "MW":
+                # need to reset the env to the same seed, and then take the same actions to reset to
+                # the selected state. not sure why metaworld doesn't have a better way of resetting to a desired state
+                info = selected_infos[indx]
+                seed = info["seed"]
+                traj_indx = selected_state_traj_indx[indx]
+                start = selector.start_indices[traj_indx]
+
+                env = make_env(
+                    config.env,
+                    config.env_id,
+                    seed,
+                    max_episode_steps=config.max_episode_steps,
+                    freeze_rand_vec=False,
+                )
+                obs, _ = env.reset()
+                actions = selector.actions[start : start + selected_indices_traj[indx]]
+
+                # take the sequence of actions to reach the state
+                for action in actions:
+                    env.step(action)
+
+                # env_state = selected_infos[indx]["env_state"]
+                # env.set_env_state(env_state)
+                obs = env.get_obs()
 
             # take some perturbation steps
             for _ in range(config.num_perturb_steps):
@@ -606,18 +683,55 @@ def run_augmentation(config, dataset, wandb_run=None):
                 next_obs, reward, done, truncated, info = env.step(action)
                 obs = next_obs
 
-            for _ in range(config.num_expert_steps_aug):
-                obs_input = np.concatenate(
-                    [obs["observation"], obs["desired_goal"], obs["meta"]],
+            if config.visualize:
+                img = np.array(env.render())
+                img = cv2.putText(
+                    img,
+                    str(indx),
+                    (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 0, 0),
+                    2,
+                    cv2.LINE_AA,
                 )
-                obs_input = obs_input[None]
+                imgs.append(img)
+
+            for _ in range(config.num_expert_steps_aug):
+                if config.env == "MAZE":
+                    obs_input = np.concatenate(
+                        [obs["observation"], obs["desired_goal"], obs["meta"]],
+                    )
+                else:
+                    obs_input = obs
+
+                if len(obs_input.shape) == 1:
+                    obs_input = obs_input[None]
+
                 # don't use the sampled action
                 action_sample, _, action_mean = actor.get_action(
                     torch.Tensor(obs_input).to(device)
                 )
                 action = action_mean[0].detach().cpu().numpy()
                 next_obs, reward, done, truncated, info = env.step(action)
+
+                if config.visualize:
+                    img = env.render()
+                    imgs.append(img)
+
+                if config.env == "MW":
+                    info["env_state"] = env.get_env_state()
+
+                    if len(obs.shape) == 1:
+                        obs = obs[None]  # add extra dimension
+
+                    if len(next_obs.shape) == 1:
+                        next_obs = next_obs[None]
+
                 rollouts.append((obs, next_obs, action, reward, done, truncated, info))
+
+                # if info["success"]:
+                #     break
 
                 obs = next_obs
 
@@ -625,7 +739,7 @@ def run_augmentation(config, dataset, wandb_run=None):
 
     # STEP 4: Save augmented dataset
     augment_data_file = create_aug_filename(config)
-    save_file = Path(config.data_dir) / augment_data_file
+    save_file = Path(config.data_dir) / "augment_datasets" / augment_data_file
     logging.info(f"Saving augmented dataset to {save_file}")
     with open(save_file, "wb") as f:
         pickle.dump(
@@ -639,6 +753,18 @@ def run_augmentation(config, dataset, wandb_run=None):
                 },
             },
             f,
+        )
+
+    if config.visualize:
+        video_file = (
+            Path(config.data_dir)
+            / "augment_datasets"
+            / augment_data_file.replace(".pkl", ".mp4")
+        )
+        imageio.mimsave(
+            video_file,
+            imgs,
+            fps=10,
         )
 
     env.close()
@@ -662,13 +788,15 @@ def main(_):
     # STEP 1: Load base dataset and pass it into each run
     logging.info("Loading dataset")
     if config.env == "MAZE" or config.env == "MW":
-        dataset, train_loader, test_loader, obs_dim, action_dim = load_pkl_dataset(
-            config.data_dir,
-            config.data_file,
-            batch_size=1,
-            num_trajs=10000,  # use all
-            train_perc=1.0,
-            env=config.env,
+        dataset, train_loader, test_loader, obs_dim, action_dim, infos = (
+            load_pkl_dataset(
+                config.data_dir,
+                config.data_file,
+                batch_size=1,
+                num_trajs=10000,  # use all
+                train_perc=1.0,
+                env=config.env,
+            )
         )
         obs_dim = obs_dim
         action_dim = action_dim
@@ -704,7 +832,7 @@ def main(_):
         config.update(param_space)
         tuner = tune.Tuner(
             tune.with_parameters(
-                run_augmentation_fn, dataset=dataset, wandb_run=wandb_run
+                run_augmentation_fn, dataset=dataset, infos=infos, wandb_run=wandb_run
             ),
             param_space=config,
             run_config=run_config,
@@ -716,7 +844,7 @@ def main(_):
         results = tuner.fit()
         print(results)
     else:
-        run_augmentation(config, dataset)
+        run_augmentation(config, dataset, infos)
 
 
 if __name__ == "__main__":

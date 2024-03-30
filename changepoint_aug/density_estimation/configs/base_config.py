@@ -27,6 +27,10 @@ def get_base_config():
     config.num_trajs = 500
     config.mode = "train"
     config.env = "MAZE"
+    config.num_augmentation_steps = 0
+    config.num_eval_envs = 10
+    config.visualize = False
+
     config.env_id = "button-press-v2"  # metaworld specific
     config.disable_tqdm = False
     config.save_video = False
@@ -34,8 +38,8 @@ def get_base_config():
     config.use_wb = False
     config.group_name = ""
     config.notes = ""
-    config.tags = []
+    config.tags = ()
 
-    config.augmentation_data_files = []
+    config.augmentation_data_files = ()
 
     return config
