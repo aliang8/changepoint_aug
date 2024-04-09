@@ -25,7 +25,7 @@ import utils as utils
 import matplotlib.pyplot as plt
 from collections import Counter
 
-from changepoint_aug.density_estimation.trainers.base_trainer import BaseTrainer
+from active_imitation_learning.trainers.base_trainer import BaseTrainer
 
 
 def create_ts(config, obs_dim, action_dim, rng_key):

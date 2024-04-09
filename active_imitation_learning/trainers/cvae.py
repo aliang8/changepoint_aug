@@ -24,10 +24,10 @@ from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_
 from functools import partial
 from tensorflow_probability.substrates import jax as tfp
 
-from changepoint_aug.density_estimation.trainers.base_trainer import BaseTrainer
-from changepoint_aug.density_estimation.utils import frange_cycle_linear
-from changepoint_aug.density_estimation.models import vae_fn, decode_fn
-from changepoint_aug.density_estimation.visualize import visualize_density_estimate
+from active_imitation_learning.trainers.base_trainer import BaseTrainer
+from active_imitation_learning.utils import frange_cycle_linear
+from active_imitation_learning.models import vae_fn, decode_fn
+from active_imitation_learning.visualize import visualize_density_estimate
 
 dist = tfp.distributions
 

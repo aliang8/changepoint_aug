@@ -12,15 +12,37 @@ import tqdm
 import jax.numpy as jnp
 from sklearn.datasets import make_blobs
 import matplotlib.pyplot as plt
-from tensordict import TensorDict
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict
 from pathlib import Path
 import os
 import wandb
-import metaworld
+
+# import metaworld
 import time
 
 os.environ["MUJOCO_GL"] = "egl"
+
+
+MAZE_MAPS = {
+    "standard": [
+        [1, 1, 1, 1, 1, 1, 1],
+        [1, "g", "g", "g", "g", "g", 1],
+        [1, 0, 0, 0, 0, 0, 1],
+        [1, 1, 0, 1, 0, 1, 1],
+        [1, 0, 0, 0, 0, 0, 1],
+        [1, "r", "r", "r", "r", "r", 1],
+        [1, 1, 1, 1, 1, 1, 1],
+    ],
+    "all_goals": [
+        [1, 1, 1, 1, 1, 1, 1],
+        [1, "c", "c", "c", "c", "c", 1],
+        [1, "c", "c", "c", "c", "c", 1],
+        [1, "c", "c", "c", "c", "c", 1],
+        [1, "c", "c", "c", "c", "c", 1],
+        [1, "c", "c", "c", "c", "c", 1],
+        [1, 1, 1, 1, 1, 1, 1],
+    ],
+}
 
 
 def make_env(
@@ -28,6 +50,7 @@ def make_env(
     env_id,
     seed,
     num_envs: int = 1,
+    maze_map: str = "standard",
     freeze_rand_vec: bool = False,
     goal_observable: bool = True,
     max_episode_steps: int = 1000,
@@ -52,20 +75,9 @@ def make_env(
             env.seed(seed)
             env = gym.wrappers.RecordEpisodeStatistics(env)
         elif env_name == "MAZE":
-            # map doesn't matter
-            map = [
-                [1, 1, 1, 1, 1, 1, 1],
-                [1, "g", "g", "g", "g", "g", 1],
-                [1, 0, 0, 0, 0, 0, 1],
-                [1, 1, 0, 1, 0, 1, 1],
-                [1, 0, 0, 0, 0, 0, 1],
-                [1, "r", "r", "r", "r", "r", 1],
-                [1, 1, 1, 1, 1, 1, 1],
-            ]
-
             env = gym.make(
                 "PointMaze_UMazeDense-v3",
-                maze_map=map,
+                maze_map=MAZE_MAPS[maze_map],
                 continuing_task=False,
                 reset_target=False,
                 render_mode="rgb_array",

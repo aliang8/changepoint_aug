@@ -17,7 +17,7 @@ from pathlib import Path
 from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
 
-from changepoint_aug.density_estimation.trainers import *
+from active_imitation_learning.trainers import *
 
 os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.01"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -107,8 +107,8 @@ def main(_):
 
         run_config = RunConfig(
             name=config["exp_name"],
-            local_dir="/scr/aliang80/changepoint_aug/changepoint_aug/density_estimation/ray_results",
-            storage_path="/scr/aliang80/changepoint_aug/changepoint_aug/density_estimation/ray_results",
+            local_dir="/scr/aliang80/active_imitation_learning/active_imitation_learning/ray_results",
+            storage_path="/scr/aliang80/active_imitation_learning/active_imitation_learning/ray_results",
             log_to_file=True,
         )
         tuner = tune.Tuner(

@@ -28,19 +28,19 @@ import sys
 import os
 import jax.scipy as jsp
 
-sys.path.append("/scr/aliang80/changepoint_aug/changepoint_aug/old")
+sys.path.append("/scr/aliang80/active_imitation_learning/active_imitation_learning/old")
 from sac_torch import Actor
 from sac_torch_mw import Actor as ActorMW
 
 from sac_eval import make_env as make_env_sac
 from sac_eval_mw import make_env as make_env_sac_mw
 
-from changepoint_aug.density_estimation.data import load_pkl_dataset, make_blob_dataset
-from changepoint_aug.density_estimation.trainers.q_sarsa import create_ts as create_ts_q
-from changepoint_aug.density_estimation.trainers.cvae import create_ts as create_ts_cvae
-from changepoint_aug.density_estimation.trainers.bc import create_ts as create_ts_bc
-from changepoint_aug.density_estimation.visualize import estimate_density
-from changepoint_aug.density_estimation.utils import make_env
+from active_imitation_learning.data import load_pkl_dataset, make_blob_dataset
+from active_imitation_learning.trainers.q_sarsa import create_ts as create_ts_q
+from active_imitation_learning.trainers.cvae import create_ts as create_ts_cvae
+from active_imitation_learning.trainers.bc import create_ts as create_ts_bc
+from active_imitation_learning.visualize import estimate_density
+from active_imitation_learning.utils import make_env
 
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -59,15 +59,15 @@ shorthands = {
     "lamb": "lam",
     "reweight_with_density": "rwd",
     "total_num_states": "tns",
+    "load_randomly_sampled_states": "rand",
 }
 
 
-def create_aug_filename(config):
-    filename = "augment_dataset"
+def create_aug_data_dir(config):
+    filename = "d"
     for k, v in shorthands.items():
         if hasattr(config, k):
             filename += f"_{v}-{getattr(config, k)}"
-    filename += ".pkl"
     return filename
 
 
@@ -137,13 +137,24 @@ class QueryStateSelector:
         self.config = config
         self.wandb_run = wandb_run
 
-        (all_obss, all_actions, _, _, _, all_dones) = dataset[:]
+        if self.config.load_randomly_sampled_states:
+            # TODO: we don't have actions here
+            self.obss = np.array(dataset)
+            action_dim = 2  # for the maze enviornment
+        else:
+            (all_obss, all_actions, _, _, _, all_dones) = dataset[:]
+            self.obss = all_obss.numpy()
+            self.actions = all_actions.numpy()
+            self.dones = all_dones.numpy()
+            action_dim = self.actions.shape[-1]
+            start_indices = np.where(self.dones)[0]
+            start_indices += 1
+            self.start_indices = np.insert(start_indices, 0, 0)
+
+        obs_dim = self.obss.shape[-1]
 
         self.rng_key = jax.random.PRNGKey(config.seed)
         self.selection_metric = config.selection_metric
-        self.obss = all_obss.numpy()
-        self.actions = all_actions.numpy()
-        self.dones = all_dones.numpy()
 
         assert self.selection_metric in [
             "q_variance",
@@ -185,9 +196,6 @@ class QueryStateSelector:
         )
         self.model_ckpt_path = model_ckpt_path
 
-        obs_dim = self.obss.shape[-1]
-        action_dim = self.actions.shape[-1]
-
         if self.selection_metric == "q_variance":
             config.load_from_ckpt = str(model_ckpt_path)
             self.ts = create_ts_q(config, obs_dim, action_dim, None)
@@ -200,10 +208,6 @@ class QueryStateSelector:
 
         logging.info(f"model ckpt path: {model_ckpt_path}")
         print(f"model ckpt path: {model_ckpt_path}")
-
-        start_indices = np.where(self.dones)[0]
-        start_indices += 1
-        self.start_indices = np.insert(start_indices, 0, 0)
 
         if self.config.reweight_with_density:
             self.density_estimates = self.compute_density_estimates()
@@ -515,6 +519,56 @@ class QueryStateSelector:
             # save figure
             plt.savefig(f"selected_states_{chunk_indx}.png")
 
+    def visualize_selected_states_global(self, selected_indices, env=None):
+        logging.info("visualizing selected states")
+
+        imgs = []
+        metrics = self.metric[np.array(selected_indices)]
+
+        for state in self.obss[selected_indices]:
+            obs, _ = env.reset_to_state(state)
+            img = env.render()
+            imgs.append(img)
+
+        # visualized selected states to augment
+        imgs = np.array(imgs)
+        n = 4
+        num_imgs = n**2
+        imgs_chunked = np.array_split(imgs, imgs.shape[0] // num_imgs)
+        metrics_chunked = np.array_split(metrics, metrics.shape[0] // num_imgs)
+
+        augment_data_dir = create_aug_data_dir(self.config)
+        vis_dir = (
+            Path(self.config.data_dir)
+            / "augment_datasets"
+            / augment_data_dir
+            / "images"
+        )
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        for chunk_indx, chunk in tqdm.tqdm(
+            enumerate(imgs_chunked), desc="saving images"
+        ):
+            # make a grid of 5 x 5 images
+            fig, axs = plt.subplots(n, n, figsize=(20, 20))
+            axs_flat = axs.flatten()
+
+            for indx, ax in enumerate(axs_flat):
+                ax.axis("off")
+                ax.imshow(chunk[indx])
+
+                # put metric as title
+                ax.set_title(
+                    f"{self.selection_metric}: {metrics_chunked[chunk_indx][indx]:.2f}"
+                )
+
+            save_path = vis_dir / f"selected_states_{chunk_indx}.png"
+
+            # remove space between figures
+            plt.subplots_adjust(wspace=0.1, hspace=0.1)
+            fig.tight_layout()
+            plt.savefig(save_path)
+
     def select_states_per_traj(self):
         """
         Handles computation of the metric and reranking states based on metric.
@@ -525,7 +579,9 @@ class QueryStateSelector:
         selected_state_traj_indx = []
 
         # pick top k states per trajectory
-        for traj_indx in tqdm.tqdm(range(len(self.start_indices) - 1)):
+        for traj_indx in tqdm.tqdm(
+            range(len(self.start_indices) - 1), desc="per traj states"
+        ):
             start = self.start_indices[traj_indx]
             end = self.start_indices[traj_indx + 1]
 
@@ -570,14 +626,15 @@ class QueryStateSelector:
         selected_state_traj_indx = []
         selected_indices_traj = []
 
-        for indx in selected_indices_global:
-            for traj_indx in range(len(self.start_indices) - 1):
-                start = self.start_indices[traj_indx]
-                end = self.start_indices[traj_indx + 1]
-                if start <= indx < end:
-                    selected_state_traj_indx.append(traj_indx)
-                    selected_indices_traj.append(indx - start)
-                    break
+        if not self.config.load_randomly_sampled_states:
+            for indx in selected_indices_global:
+                for traj_indx in range(len(self.start_indices) - 1):
+                    start = self.start_indices[traj_indx]
+                    end = self.start_indices[traj_indx + 1]
+                    if start <= indx < end:
+                        selected_state_traj_indx.append(traj_indx)
+                        selected_indices_traj.append(indx - start)
+                        break
 
         return selected_indices_traj, selected_indices_global, selected_state_traj_indx
 
@@ -614,10 +671,11 @@ def run_augmentation(config, dataset, infos, wandb_run=None):
 
     logging.info(f"number of selected states: {len(selected_indices_global)}")
 
-    # if config.visualize:
-    #     selector.visualize_selected_states(
-    #         selected_indices_global, selected_state_traj_indx, env
-    #     )
+    if config.visualize:
+        # selector.visualize_selected_states(
+        #     selected_indices_global, selected_state_traj_indx, env
+        # )
+        selector.visualize_selected_states_global(selected_indices_global, env)
 
     # STEP 3: Augment selected states with a few steps of expert actions
     # Perturb states a little bit
@@ -636,8 +694,10 @@ def run_augmentation(config, dataset, infos, wandb_run=None):
     rollouts = []
 
     selected_states = selector.obss[selected_indices_global]
-    selected_infos = [infos[ind] for ind in selected_indices_global]
-
+    if not config.load_randomly_sampled_states:
+        selected_infos = [infos[ind] for ind in selected_indices_global]
+    else:
+        selected_infos = None
     # import ipdb
 
     # ipdb.set_trace()
@@ -646,7 +706,9 @@ def run_augmentation(config, dataset, infos, wandb_run=None):
     imgs = []
 
     # total number of new transitions = (# augmentations per state) x (# num total trajs) x (# expert steps)
-    for indx, state in tqdm.tqdm(enumerate(selected_states)):
+    for indx, state in tqdm.tqdm(
+        enumerate(selected_states), desc="collecting augmentations"
+    ):
 
         for _ in range(config.num_augmentations_per_state):
             if config.env == "MAZE":
@@ -738,8 +800,10 @@ def run_augmentation(config, dataset, infos, wandb_run=None):
     logging.info(f"number of new transitions: {len(rollouts)}")
 
     # STEP 4: Save augmented dataset
-    augment_data_file = create_aug_filename(config)
-    save_file = Path(config.data_dir) / "augment_datasets" / augment_data_file
+    augment_data_dir = create_aug_data_dir(config)
+    save_dir = Path(config.data_dir) / "augment_datasets" / augment_data_dir
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_file = save_dir / "dataset.pkl"
     logging.info(f"Saving augmented dataset to {save_file}")
     with open(save_file, "wb") as f:
         pickle.dump(
@@ -757,9 +821,7 @@ def run_augmentation(config, dataset, infos, wandb_run=None):
 
     if config.visualize:
         video_file = (
-            Path(config.data_dir)
-            / "augment_datasets"
-            / augment_data_file.replace(".pkl", ".mp4")
+            Path(config.data_dir) / "augment_datasets" / augment_data_dir / "trajs.mp4"
         )
         imageio.mimsave(
             video_file,
@@ -788,19 +850,27 @@ def main(_):
     # STEP 1: Load base dataset and pass it into each run
     logging.info("Loading dataset")
     if config.env == "MAZE" or config.env == "MW":
-        dataset, train_loader, test_loader, obs_dim, action_dim, infos = (
-            load_pkl_dataset(
-                config.data_dir,
-                config.data_file,
-                batch_size=1,
-                num_trajs=10000,  # use all
-                train_perc=1.0,
-                env=config.env,
+        if config.load_randomly_sampled_states:
+            dataset_f = Path(config.data_dir) / config.data_file
+            with open(dataset_f, "rb") as f:
+                dataset = pickle.load(f)
+            logging.info(f"number of random states: {len(dataset)}")
+            infos = None
+            config.selection = "global"
+        else:
+            dataset, train_loader, test_loader, obs_dim, action_dim, infos = (
+                load_pkl_dataset(
+                    config.data_dir,
+                    config.data_file,
+                    batch_size=1,
+                    num_trajs=10000,  # use all
+                    train_perc=1.0,
+                    env=config.env,
+                )
             )
-        )
-        obs_dim = obs_dim
-        action_dim = action_dim
-        logging.info(f"obs_dim: {obs_dim} action_dim: {action_dim}")
+            obs_dim = obs_dim
+            action_dim = action_dim
+            logging.info(f"obs_dim: {obs_dim} action_dim: {action_dim}")
     else:
         raise NotImplementedError
 

@@ -24,7 +24,7 @@ from typing import Any
 from pathlib import Path
 from tensorflow_probability.substrates import jax as tfp
 
-from changepoint_aug.density_estimation.data import load_pkl_dataset, make_blob_dataset
+from active_imitation_learning.data import load_pkl_dataset, make_blob_dataset
 
 dist = tfp.distributions
 
@@ -43,7 +43,7 @@ class BaseTrainer:
             self.wandb_run = wandb.init(
                 # set the wandb project where this run will be logged
                 entity="glamor",
-                project="data_augmentation",
+                project="active_imitation_learning",
                 name=config.exp_name,
                 notes=self.config.notes,
                 tags=self.config.tags,
@@ -92,7 +92,7 @@ class BaseTrainer:
                     num_trajs=self.config.num_trajs,
                     train_perc=self.config.train_perc,
                     env=self.config.env,
-                    augmentation_data_files=self.config.augmentation_data_files,
+                    augmentation_data=self.config.augmentation_data,
                     num_augmentation_steps=self.config.num_augmentation_steps,
                 )
             )

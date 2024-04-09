@@ -5,6 +5,7 @@ from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_
 def get_config():
     config = get_base_config()
     config.exp_name = "augment"
+    config.load_randomly_sampled_states = False
 
     config.top_k = 1
     config.selection_metric = "policy_variance"
@@ -57,9 +58,7 @@ def get_config():
     config.model_ckpt = "nt-100_s-0"
     config.ckpt_step = 900
 
-    config.oracle_model_ckpt_path = (
-        "/scr/aliang80/changepoint_aug/changepoint_aug/old/model_ckpts/sac_maze_5M.pt"
-    )
+    config.oracle_model_ckpt_path = "/scr/aliang80/active_imitation_learning/active_imitation_learning/model_ckpts/sac_maze_5M.pt"
 
     config.augment_data_file = ""
     return config

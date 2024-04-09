@@ -19,9 +19,9 @@ import utils as utils
 import matplotlib.pyplot as plt
 from collections import Counter
 
-from changepoint_aug.density_estimation.trainers.base_trainer import BaseTrainer
-from changepoint_aug.density_estimation.models import policy_fn, gaussian_policy_fn
-from changepoint_aug.density_estimation.visualize import visualize_policy_var
+from active_imitation_learning.trainers.base_trainer import BaseTrainer
+from active_imitation_learning.models import policy_fn, gaussian_policy_fn
+from active_imitation_learning.visualize import visualize_policy_var
 
 dist = tfp.distributions
 

@@ -5,9 +5,11 @@ def get_base_config():
     config = ConfigDict()
     config.seed = 0
     config.exp_name = "i001"
-    config.root_dir = "/scr/aliang80/changepoint_aug/changepoint_aug/density_estimation"
+    config.root_dir = (
+        "/scr/aliang80/active_imitation_learning/active_imitation_learning"
+    )
     config.data_dir = (
-        "/scr/aliang80/changepoint_aug/changepoint_aug/density_estimation/datasets"
+        "/scr/aliang80/active_imitation_learning/active_imitation_learning/datasets"
     )
     config.ckpt_dir = "model_ckpts"
     config.load_from_ckpt = ""  # ckpt file

@@ -23,9 +23,12 @@ def get_config():
     # augmentation parameters
     config.num_augmentation_steps = 1000
     # config.augmentation_data_files = [
-    #     "augment_dataset_eid-MAZE_nes-10_nap-1_nps-1_selm-policy_variance_sel-per_traj_lam-1.3_rwd-False_tns-100.pkl"
+    #     "d_eid-MAZE_nes-10_nap-1_nps-1_selm-policy_variance_sel-per_traj_lam-1.3_rwd-False_tns-100"
+    # ]
+    # config.augmentation_data_files = [
+    #     "d_eid-MAZE_nes-20_nap-1_nps-2_selm-influence_function_sel-per_traj_lam-1.3_rwd-False_tns-100"
     # ]
     config.augmentation_data_files = [
-        "augment_dataset_eid-MAZE_nes-20_nap-1_nps-2_selm-influence_function_sel-per_traj_lam-1.3_rwd-False_tns-100.pkl"
+        "d_eid-MAZE_nes-20_nap-1_nps-1_selm-policy_variance_sel-global_lam-1.3_rwd-False_tns-100_rand-True"
     ]
     return config

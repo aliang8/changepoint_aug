@@ -91,7 +91,7 @@ def load_pkl_dataset(
     batch_size: int,
     train_perc: float = 1.0,
     env: str = "MAZE",
-    augmentation_data_files: List[str] = [],
+    augmentation_data: List[str] = [],
     num_augmentation_steps: int = 0,
 ):
     data_file = Path(data_dir) / data_file
@@ -120,7 +120,8 @@ def load_pkl_dataset(
     logging.info(f"average length of base rollout: {avg_rollout_len}")
 
     augmentation_rollouts = []
-    for data_file in augmentation_data_files:
+    for data_dir in augmentation_data:
+        data_file = Path(data_dir) / "dataset.pkl"
         logging.info(f"loading augmentation file: {data_file}")
         data_file = Path(data_dir) / "augment_datasets" / data_file
         with open(data_file, "rb") as f:
