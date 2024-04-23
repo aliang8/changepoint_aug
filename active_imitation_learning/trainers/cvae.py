@@ -25,7 +25,7 @@ from functools import partial
 from tensorflow_probability.substrates import jax as tfp
 
 from active_imitation_learning.trainers.base_trainer import BaseTrainer
-from active_imitation_learning.utils import frange_cycle_linear
+from active_imitation_learning.utils.utils import frange_cycle_linear
 from active_imitation_learning.models import vae_fn, decode_fn
 from active_imitation_learning.visualize import visualize_density_estimate
 

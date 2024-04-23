@@ -8,17 +8,20 @@ from tensorflow_probability.substrates import jax as tfp
 dist = tfp.distributions
 
 
-def visualize_policy_var(ts, rng_key, config, obss, goal):
+def visualize_policy_var(
+    ts, rng_key, config, obss, goal=None, plot_trajectory: bool = False
+):
     T = np.arange(len(obss))
 
     plt.clf()
+    num_plots = 2 if plot_trajectory else 1
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
     axes = axes.flatten()
 
     policy_rng_keys = jax.random.split(rng_key, config.num_policies + 1)
     if config.policy_cls == "mlp":
         action_preds = jax.vmap(
-            lambda param, rng_key: ts.apply_fn(param, rng_key, obss)
+            lambda param, rng_key: ts.apply_fn(param, rng_key, obs=obss)
         )(ts.params, policy_rng_keys[1:])
 
         # compute variance between ensemble
@@ -26,15 +29,13 @@ def visualize_policy_var(ts, rng_key, config, obss, goal):
 
     else:
         mean, logvar = jax.vmap(
-            lambda param, rng_key: ts.apply_fn(param, rng_key, obss)
+            lambda param, rng_key: ts.apply_fn(param, rng_key, obs=obss)
         )(ts.params, policy_rng_keys[1:])
 
         # compute variance based on this https://arxiv.org/pdf/1612.01474.pdf
         variance = jnp.exp(logvar)
         ensemble_mean = jnp.mean(mean, axis=0)
-        variance = (variance + mean**2).sum(
-            axis=0
-        ) / config.num_policies - ensemble_mean**2
+        variance = (variance + mean**2).mean(axis=0) - ensemble_mean**2
 
     # compute mean over action dimension
     variance = jnp.mean(variance, axis=-1)
@@ -46,22 +47,23 @@ def visualize_policy_var(ts, rng_key, config, obss, goal):
     axes[0].set_ylabel("Ensemble Variance")
     axes[0].set_title(f"Policy Ensemble Variance")
 
-    # plot the trajectory
-    traj_xy = obss[:, :2]
-    (traj_plot,) = axes[1].plot(traj_xy[:, 0], traj_xy[:, 1], linewidth=4)
-    axes[1].plot(goal[0], goal[1], "g*", markersize=10)
-    # axes[2].set_xlim(min_x, max_x)
-    # axes[2].set_ylim(min_y, max_y)
-    axes[1].set_xlabel("x")
-    axes[1].set_ylabel("y")
-    axes[1].set_title(f"Trajectory")
+    if plot_trajectory:
+        # plot the trajectory
+        traj_xy = obss[:, :2]
+        (traj_plot,) = axes[1].plot(traj_xy[:, 0], traj_xy[:, 1], linewidth=4)
+        axes[1].plot(goal[0], goal[1], "g*", markersize=10)
+        # axes[2].set_xlim(min_x, max_x)
+        # axes[2].set_ylim(min_y, max_y)
+        axes[1].set_xlabel("x")
+        axes[1].set_ylabel("y")
+        axes[1].set_title(f"Trajectory")
 
-    # find location with max variance
-    max_var_idx = np.argmax(variance)
-    # set vline there
-    axes[0].axvline(x=max_var_idx, color="r", linestyle="--", linewidth=4)
-    max_var_point = obss[max_var_idx, :2]
-    axes[1].plot(max_var_point[0], max_var_point[1], "ro")
+        # find location with max variance
+        max_var_idx = np.argmax(variance)
+        # set vline there
+        axes[0].axvline(x=max_var_idx, color="r", linestyle="--", linewidth=4)
+        max_var_point = obss[max_var_idx, :2]
+        axes[1].plot(max_var_point[0], max_var_point[1], "ro")
     return fig
 
 

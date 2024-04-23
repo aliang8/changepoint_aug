@@ -31,7 +31,8 @@ def get_base_config():
     config.env = "MAZE"
     config.num_augmentation_steps = 0
     config.num_eval_envs = 10
-    config.visualize = False
+    config.visualize_rollouts = False
+    config.skip_first_eval = False
 
     config.env_id = "button-press-v2"  # metaworld specific
     config.disable_tqdm = False
@@ -41,7 +42,5 @@ def get_base_config():
     config.group_name = ""
     config.notes = ""
     config.tags = ()
-
-    config.augmentation_data_files = ()
 
     return config

@@ -6,7 +6,7 @@ import haiku as hk
 from tensorflow_probability.substrates import jax as tfp
 import dataclasses
 from typing import NamedTuple
-from utils import create_masks
+from active_imitation_learning.utils.utils import create_masks
 
 dist = tfp.distributions
 
@@ -68,13 +68,11 @@ class QFunction(hk.Module):
 
 
 @hk.transform
-def policy_fn(obs, hidden_size, action_dim):
-    return Policy(hidden_size, action_dim)(obs)
-
-
-@hk.transform
-def gaussian_policy_fn(obs, hidden_size, action_dim):
-    return GaussianPolicy(hidden_size, action_dim)(obs)
+def policy_fn(policy_cls, obs, hidden_size, action_dim):
+    if policy_cls == "mlp":
+        return Policy(hidden_size, action_dim)(obs)
+    elif policy_cls == "gaussian":
+        return GaussianPolicy(hidden_size, action_dim)(obs)
 
 
 @hk.transform

@@ -21,7 +21,7 @@ from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_
 from functools import partial
 from flax.training.train_state import TrainState
 from typing import Any
-import utils as utils
+import active_imitation_learning.utils.utils as utils
 import matplotlib.pyplot as plt
 from collections import Counter
 

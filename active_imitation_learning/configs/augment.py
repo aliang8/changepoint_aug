@@ -40,7 +40,7 @@ def get_config():
     config.num_posterior_samples = 100
 
     # policies
-    config.policy_cls = "mlp"
+    config.policy_cls = "gaussian"
     config.num_policies = 5
 
     # influence functions
@@ -52,13 +52,22 @@ def get_config():
     config.density_ckpt_step = 950
 
     # for loading model to compute the heuristic
-    # config.exp_name = "i002_q_sarsa"
-    # config.model_ckpt = "nt-25_s-0"
-    config.exp_name = "i022_bc_base"
-    config.model_ckpt = "nt-100_s-0"
-    config.ckpt_step = 900
+    config.exp_name = "i032_bc"
+    config.model_ckpt = (
+        "i032_bc_s-0_nt-5_eid-maze_2d_wall_v0_nat-0_nas-0_ne-5000_np-5_pc-gaussian_t-bc"
+    )
+    config.ckpt_step = 5000
 
     config.oracle_model_ckpt_path = "/scr/aliang80/active_imitation_learning/active_imitation_learning/model_ckpts/sac_maze_5M.pt"
 
-    config.augment_data_file = ""
+    config.keys_to_include = {
+        "env": None,
+        "num_expert_steps_aug": None,
+        "num_augmentations_per_state": None,
+        "num_perturb_steps": None,
+        "selection": None,
+        "selection_metric": None,
+        "reweight_with_density": None,
+        # "total_num_states": None,
+    }
     return config

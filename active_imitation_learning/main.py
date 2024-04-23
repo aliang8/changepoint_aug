@@ -10,6 +10,7 @@ import tqdm
 import pickle
 import time
 import flax
+import collections
 from ml_collections import ConfigDict, FieldReference, FrozenConfigDict, config_flags
 from typing import Any
 import pickle
@@ -42,13 +43,35 @@ psh = {
     "num_augmentation_steps": "nas",
     "seed": "s",
     "kl_div_weight": "kl",
+    "base_num_trajs": "nt",
+    "num_additional_trajs": "nat",
+    "num_shuffles": "ns",
+    "base_num_trajs": "nt",
 }
 
 # run with ray tune
 param_space = {
-    "seed": tune.grid_search([0, 1, 2, 3, 4]),
-    "num_trajs": tune.grid_search([5, 10, 25, 50, 75]),
+    "seed": tune.grid_search([0, 1, 2, 3]),
+    "base_num_trajs": tune.grid_search([5, 10, 25, 50]),
+    # "num_additional_trajs": tune.grid_search([5]),
+    # "num_shuffles": tune.grid_search([1, 2, 3, 4]),
 }
+
+
+def update(source, overrides):
+    """
+    Update a nested dictionary or similar mapping.
+    Modify ``source`` in place.
+    """
+    for key, value in overrides.items():
+        if type(source[key]) != type(overrides[key]):
+            source[key] = overrides[key]
+        elif isinstance(value, collections.abc.Mapping) and value:
+            returned = update(source.get(key, {}), value)
+            source[key] = returned
+        else:
+            source[key] = overrides[key]
+    return source
 
 
 def train_model_fn(config):
@@ -88,13 +111,30 @@ def train_model_fn(config):
 
 def trial_str_creator(trial):
     trial_str = trial.config["exp_name"] + "_"
-    for k, v in trial.config.items():
-        if k in psh and k in param_space:
-            trial_str += f"{psh[k]}-{v}_"
-    # trial_str += str(trial.trial_id)
+
+    for k, override in param_space.items():
+        if k in trial.config:
+            if isinstance(override, dict) and "grid_search" not in override:
+                for k2 in override.keys():
+                    if k2 in trial.config[k]:
+                        trial_str += f"{psh[k][k2]}-{trial.config[k][k2]}_"
+            else:
+                trial_str += f"{psh[k]}-{trial.config[k]}_"
+
+    # also add keys to include
+    for k, v in trial.config["keys_to_include"].items():
+        if v is None:
+            if k not in param_space:
+                trial_str += f"{psh[k]}-{trial.config[k]}_"
+        else:
+            for k2 in v:
+                if k not in param_space or (
+                    k in param_space and k2 not in param_space[k]
+                ):
+                    trial_str += f"{psh[k][k2]}-{trial.config[k][k2]}_"
 
     trial_str = trial_str[:-1]
-    logging.info(f"trial_str: {trial_str}")
+    print("trial_str: ", trial_str)
     return trial_str
 
 
@@ -102,8 +142,8 @@ def main(_):
     config = _CONFIG.value.to_dict()
     if config["smoke_test"] is False:
         config["use_wb"] = True  # always log to wandb when we are running with ray tune
-        config.update(param_space)
-        train_model = tune.with_resources(train_model_fn, {"cpu": 5, "gpu": 0.1})
+        config = update(config, param_space)
+        train_model = tune.with_resources(train_model_fn, {"cpu": 5, "gpu": 0.2})
 
         run_config = RunConfig(
             name=config["exp_name"],

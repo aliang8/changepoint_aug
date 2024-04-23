@@ -10,6 +10,49 @@ from typing import Any, Dict, List, Tuple
 from pathlib import Path
 
 
+def split_data_by_traj(data, max_traj_length):
+    dones = data["dones"].astype(bool)
+    start = 0
+    splits = []
+    for i, done in enumerate(dones):
+        if i - start + 1 >= max_traj_length or done:
+            splits.append(index_batch(data, slice(start, i + 1)))
+            start = i + 1
+
+    if start < len(dones):
+        splits.append(index_batch(data, slice(start, None)))
+
+    return splits
+
+
+def concatenate_batches(batches):
+    concatenated = {}
+    for key in batches[0].keys():
+        concatenated[key] = np.concatenate(
+            [batch[key] for batch in batches], axis=0
+        ).astype(np.float32)
+    return concatenated
+
+
+def parition_batch_train_test(batch, train_ratio):
+    train_indices = np.random.rand(batch["observations"].shape[0]) < train_ratio
+    train_batch = index_batch(batch, train_indices)
+    test_batch = index_batch(batch, ~train_indices)
+    return train_batch, test_batch
+
+
+def index_batch(batch, indices):
+    indexed = {}
+    for key in batch.keys():
+        indexed[key] = batch[key][indices, ...]
+    return indexed
+
+
+def subsample_batch(batch, size):
+    indices = np.random.randint(batch["observations"].shape[0], size=size)
+    return index_batch(batch, indices)
+
+
 def make_blob_dataset(
     n_samples, centers, n_features, random_state, train_perc: float, batch_size: int
 ):
@@ -23,32 +66,7 @@ def make_blob_dataset(
     X = torch.from_numpy(X)
     y = torch.from_numpy(y)
     dataset = torch.utils.data.TensorDataset(X, y)
-
-    # split into train and test
-    train_size = int(train_perc * n_samples)
-    test_size = n_samples - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, test_size]
-    )
-
-    # convert for using with jax
-    train_dataloader = NumpyLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, drop_last=True
-    )
-    test_dataloader = NumpyLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, drop_last=True
-    )
-
-    print("number of train batches: ", len(train_dataloader))
-    print("number of test batches: ", len(test_dataloader))
-
-    return (
-        dataset,
-        train_dataloader,
-        test_dataloader,
-        2,
-        1,
-    )
+    return dataset
 
 
 def numpy_collate(batch):
@@ -84,17 +102,8 @@ class NumpyLoader(torch.utils.data.DataLoader):
         )
 
 
-def load_pkl_dataset(
-    data_dir: str,
-    data_file: str,
-    num_trajs: int,
-    batch_size: int,
-    train_perc: float = 1.0,
-    env: str = "MAZE",
-    augmentation_data: List[str] = [],
-    num_augmentation_steps: int = 0,
-):
-    data_file = Path(data_dir) / data_file
+def load_maze_dataset(config):
+    data_file = Path(config.data_dir) / config.data_file
     with open(data_file, "rb") as f:
         data = pickle.load(f)
 
@@ -104,7 +113,7 @@ def load_pkl_dataset(
     rollout = []
     for t, transition in enumerate(data):
         obs_t, obs_tp1, action, rew, terminated, truncated, info = transition
-        if env == "MW":
+        if config.env == "MW":
             terminated = info["success"][0]
         rollout.append((obs_t, obs_tp1, action, rew, terminated, truncated, info))
 
@@ -120,16 +129,24 @@ def load_pkl_dataset(
     logging.info(f"average length of base rollout: {avg_rollout_len}")
 
     augmentation_rollouts = []
-    for data_dir in augmentation_data:
-        data_file = Path(data_dir) / "dataset.pkl"
+    total_aug_transitions = 0
+    for data_file in config.augmentation_data:
+        data_file = (
+            Path(config.data_dir) / "augment_datasets" / data_file / "dataset.pkl"
+        )
         logging.info(f"loading augmentation file: {data_file}")
-        data_file = Path(data_dir) / "augment_datasets" / data_file
+
         with open(data_file, "rb") as f:
             data = pickle.load(f)
 
         metadata = data["metadata"]
         data = data["rollouts"]
         steps = metadata["config"]["num_expert_steps_aug"]
+        num_transitions = metadata["num_transitions"]
+        total_aug_transitions += num_transitions
+        logging.info(
+            f"loading augmentation dataset, steps: {steps}, num transitions: {num_transitions}"
+        )
 
         # split data into list
         rollout = [data[i : i + steps] for i in range(0, len(data), steps)]
@@ -144,19 +161,43 @@ def load_pkl_dataset(
     done_data = []
     info_data = []
 
-    # select subset of random trajectories
+    # select subset of random trajectories for base
     traj_indices = np.random.choice(
-        len(rollouts), min(len(rollouts), num_trajs), replace=False
+        len(rollouts), min(len(rollouts), config.base_num_trajs), replace=False
     )
-    rollouts = [rollouts[i] for i in traj_indices.tolist()]
-    # print(traj_indices.tolist())
-    logging.info(f"number of selected rollouts base: {len(rollouts)}")
+    traj_indices = traj_indices.tolist()
+    logging.info(f"old: {traj_indices}")
+
+    # additional new trajs
+    if config.num_additional_trajs > 0:
+        for _ in range(config.num_shuffles):
+            new_traj_indices = np.random.choice(
+                len(rollouts), config.num_additional_trajs, replace=False
+            )
+        logging.info(f"new: {new_traj_indices}")
+        traj_indices.extend(new_traj_indices.tolist())
+
+    rollouts = [rollouts[i] for i in traj_indices]
+    # import ipdb
+
+    # ipdb.set_trace()
+    num_base_transitions = 0
+    for rollout in rollouts:
+        num_base_transitions += len(rollout)
+
+    logging.info(f"number of base trajectories: {len(rollouts)}")
+    logging.info(f"number of base transitions: {num_base_transitions}")
 
     if len(augmentation_rollouts) > 0:
         # add augmentation data
         # subsample augmentation rollouts to be num_augmentation_steps
-        num_aug_trajs = int(num_augmentation_steps // len(augmentation_rollouts[0]))
-        logging.info(f"number of augmentation trajectories to use: {num_aug_trajs}")
+        num_transitions = (
+            config.num_augmentation_steps
+            if config.num_augmentation_steps > 0
+            else total_aug_transitions
+        )
+        num_aug_trajs = int(num_transitions // len(augmentation_rollouts[0]))
+        logging.info(f"num aug trajs available: {num_aug_trajs}")
 
         aug_traj_indices = np.random.choice(
             len(augmentation_rollouts),
@@ -166,15 +207,13 @@ def load_pkl_dataset(
         augmentation_rollouts = [
             augmentation_rollouts[i] for i in aug_traj_indices.tolist()
         ]
-        logging.info(
-            f"actual number of augmentation trajectories to use: {num_aug_trajs}"
-        )
+        logging.info(f"num aug trajs used: {num_aug_trajs}")
 
         rollouts.extend(augmentation_rollouts)
 
     for rollout in rollouts:
         obs = [step[0] for step in rollout]
-        if env == "MAZE":
+        if config.env == "MAZE":
             if isinstance(obs[0], np.ndarray):
                 obs[0] = obs[0][0]
 
@@ -198,69 +237,11 @@ def load_pkl_dataset(
         rew_data.extend([step[3] for step in rollout][1:])
         info_data.extend([step[-1] for step in rollout])
 
-    # convert to torch tensors
-    obs_data = torch.from_numpy(np.array(obs_data)).squeeze()
-    obs_tp1_data = torch.from_numpy(np.array(obs_tp1_data)).squeeze()
-    action_data = torch.from_numpy(np.array(action_data))
-    action_tp1_data = torch.from_numpy(np.array(action_tp1_data))
-    rew_data = torch.from_numpy(np.array(rew_data))
-    done_data = torch.from_numpy(np.array(done_data))
-
-    # tensor_dict = {
-    #     "obs_data": obs_data,
-    #     "obs_tp1_data": obs_tp1_data,
-    #     "action_data": action_data,
-    #     "action_tp1_data": action_tp1_data,
-    #     "rew_data": rew_data,
-    #     "done_data": done_data,
-    # }
-
-    logging.info(
-        f"obs_data shape: {obs_data.shape} action_data shape: {action_data.shape}"
-    )
-    logging.info(
-        f"min obs data: {obs_data.min(axis=0)}, max obs data: {obs_data.max(axis=0)}"
-    )
-    logging.info(
-        f"min action data: {action_data.min(axis=0)}, max action data: {action_data.max(axis=0)}"
-    )
-
-    # data = TensorDict(tensor_dict, batch_size=len(obs_data))
-
-    # create dataloader
-    dataset = torch.utils.data.TensorDataset(
-        obs_data, action_data, obs_tp1_data, action_tp1_data, rew_data, done_data
-    )
-
-    # split into train and test
-    train_size = int(train_perc * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, test_size]
-    )
-
-    # convert for using with jax
-    train_dataloader = NumpyLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, drop_last=True
-    )
-    test_dataloader = NumpyLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, drop_last=True
-    )
-
-    batch = next(iter(train_dataloader))
-    logging.info(batch[0][0])
-    # import ipdb
-
-    # ipdb.set_trace()
-
-    logging.info(f"number of train batches: {len(train_dataloader)}")
-    logging.info(f"number of test batches: {len(test_dataloader)}")
-
-    return (
-        dataset,
-        train_dataloader,
-        test_dataloader,
-        obs_data.shape[-1],
-        action_data.shape[-1],
-        info_data,
-    )
+    dataset = {
+        "observations": np.array(obs_data),
+        "actions": np.array(action_data),
+        "next_observations": np.array(obs_tp1_data),
+        "rewards": np.array(rew_data),
+        "dones": np.array(done_data),
+    }
+    return dataset

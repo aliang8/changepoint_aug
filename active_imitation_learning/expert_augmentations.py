@@ -12,6 +12,7 @@ import tqdm
 import torch
 import wandb
 import io
+import json
 import time
 import cv2
 import imageio
@@ -26,21 +27,22 @@ from ray import train, tune
 from ray.train import RunConfig, ScalingConfig
 import sys
 import os
+import haiku as hk
 import jax.scipy as jsp
 
-sys.path.append("/scr/aliang80/active_imitation_learning/active_imitation_learning/old")
+sys.path.append("/scr/aliang80/active_imitation_learning/old")
 from sac_torch import Actor
 from sac_torch_mw import Actor as ActorMW
 
 from sac_eval import make_env as make_env_sac
 from sac_eval_mw import make_env as make_env_sac_mw
 
-from active_imitation_learning.data import load_pkl_dataset, make_blob_dataset
+from active_imitation_learning.utils.data import load_maze_dataset, make_blob_dataset
 from active_imitation_learning.trainers.q_sarsa import create_ts as create_ts_q
 from active_imitation_learning.trainers.cvae import create_ts as create_ts_cvae
 from active_imitation_learning.trainers.bc import create_ts as create_ts_bc
 from active_imitation_learning.visualize import estimate_density
-from active_imitation_learning.utils import make_env
+from active_imitation_learning.utils.env_utils import make_env
 
 # os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
@@ -65,9 +67,8 @@ shorthands = {
 
 def create_aug_data_dir(config):
     filename = "d"
-    for k, v in shorthands.items():
-        if hasattr(config, k):
-            filename += f"_{v}-{getattr(config, k)}"
+    for k, v in config.keys_to_include.items():
+        filename += f"_{shorthands[k]}-{getattr(config, k)}"
     return filename
 
 
@@ -142,18 +143,19 @@ class QueryStateSelector:
             self.obss = np.array(dataset)
             action_dim = 2  # for the maze enviornment
         else:
-            (all_obss, all_actions, _, _, _, all_dones) = dataset[:]
-            self.obss = all_obss.numpy()
-            self.actions = all_actions.numpy()
-            self.dones = all_dones.numpy()
+            self.obss = dataset["observations"]
+            self.actions = dataset["actions"]
+            self.dones = dataset["dones"]
+            self.infos = dataset["infos"] if "infos" in dataset else None
             action_dim = self.actions.shape[-1]
             start_indices = np.where(self.dones)[0]
             start_indices += 1
             self.start_indices = np.insert(start_indices, 0, 0)
+            logging.info(f"starting indices: {self.start_indices}")
 
-        obs_dim = self.obss.shape[-1]
+        obs_shape = self.obss.shape
+        logging.info(f"obs shape: {obs_shape}, action dim: {action_dim}")
 
-        self.rng_key = jax.random.PRNGKey(config.seed)
         self.selection_metric = config.selection_metric
 
         assert self.selection_metric in [
@@ -190,21 +192,34 @@ class QueryStateSelector:
             Path(config.root_dir)
             / "ray_results"
             / config.exp_name
-            / f"{config.exp_name}_{config.model_ckpt}"
+            / config.model_ckpt
             / config.ckpt_dir
             / f"epoch_{config.ckpt_step}.pkl"
         )
         self.model_ckpt_path = model_ckpt_path
 
+        model_config_path = (
+            Path(config.root_dir)
+            / "ray_results"
+            / config.exp_name
+            / config.model_ckpt
+            / "params.json"
+        )
+        with open(model_config_path, "r") as f:
+            model_cfg = json.load(f)
+            model_cfg = ConfigDict(model_cfg)
+        self.model_cfg = model_cfg
+        self.rng_seq = hk.PRNGSequence(model_cfg.seed)
+
         if self.selection_metric == "q_variance":
             config.load_from_ckpt = str(model_ckpt_path)
-            self.ts = create_ts_q(config, obs_dim, action_dim, None)
+            self.ts = create_ts_q(config, obs_shape, action_dim, None)
         elif (
             self.selection_metric == "policy_variance"
             or self.selection_metric == "influence_function"
         ):
             config.load_from_ckpt = str(model_ckpt_path)
-            self.ts = create_ts_bc(config, obs_dim, action_dim, None)
+            self.ts = create_ts_bc(model_cfg, obs_shape, action_dim, next(self.rng_seq))
 
         logging.info(f"model ckpt path: {model_ckpt_path}")
         print(f"model ckpt path: {model_ckpt_path}")
@@ -290,18 +305,27 @@ class QueryStateSelector:
             metric = jnp.var(q, axis=1)
 
         elif self.selection_metric == "policy_variance":
-            logging.info(f"computing policy variance")
-            policy_rng_keys = jax.random.split(
-                self.rng_key, self.config.num_policies + 1
-            )
-            self.rng_key = policy_rng_keys[0]
-            action_preds = jax.vmap(
-                lambda param, rng_key: self.ts.apply_fn(param, rng_key, self.obss)
-            )(self.ts.params, policy_rng_keys[1:])
+            logging.info(f"computing policy variance over ensemble of policies")
+            rng_key = next(self.rng_seq)
+            policy_rng_keys = jax.random.split(rng_key, self.config.num_policies)
+            policy_output = jax.vmap(
+                lambda param, rng_key: self.ts.apply_fn(param, rng_key, obs=self.obss)
+            )(self.ts.params, policy_rng_keys)
 
-            # compute variance between ensemble
-            # average over ensemble and sum over action dim
-            metric = jnp.var(action_preds, axis=0).sum(axis=-1)
+            if self.model_cfg.policy_cls == "mlp":
+                pass
+            elif self.model_cfg.policy_cls == "gaussian":
+                mean, logvar = policy_output
+                ensemble_mean = mean.mean(axis=0)
+                variance = jnp.exp(logvar)
+
+                # compute variance between ensemble
+                # average over ensemble
+                # see: https://arxiv.org/pdf/1612.01474.pdf
+                action_variance = (variance + mean**2).mean(axis=0) - ensemble_mean**2
+
+            metric = action_variance.sum(axis=-1)
+            # metric = jnp.var(action_preds, axis=0).sum(axis=-1)
 
         elif self.selection_metric == "influence_function":
             # this depends on what we want to compute influence of point wrt to
@@ -309,7 +333,8 @@ class QueryStateSelector:
             # let's just use the first policy in ensemble
             params = jax.tree_map(lambda x: x[0], self.ts.params)
             self.ts = self.ts.replace(params=params)
-            policy_rng, self.rng_key = jax.random.split(self.rng_key)
+            rng_key = next(self.rng_seq)
+            policy_rng = jax.random.split(rng_key)
             action_preds = self.ts.apply_fn(self.ts.params, policy_rng, self.obss)
             residuals = optax.squared_error(self.actions, action_preds)
 
@@ -358,168 +383,12 @@ class QueryStateSelector:
             logging.info(
                 f"done computing influence function, time taken: {time.time() - start}"
             )
+
+        assert metric.shape[0] == self.obss.shape[0]
         logging.info(f"metric max: {np.max(metric)}, min: {np.min(metric)}")
         return metric
 
-    def visualize_selected_states(
-        self, selected_indices, selected_state_traj_indx, env=None
-    ):
-        num_states = len(selected_indices)
-        num_rows_per_fig = self.config.max_states_visualize
-        selected_states = self.obss[selected_indices]
-
-        # chunk the selected states
-        selected_states_chunk = np.array_split(
-            selected_states, num_states // (num_rows_per_fig * 2)
-        )
-        selected_state_traj_indx_chunk = np.array_split(
-            selected_state_traj_indx, num_states // (num_rows_per_fig * 2)
-        )
-
-        for chunk_indx, chunk in tqdm.tqdm(enumerate(selected_states_chunk)):
-            imgs = []
-            for state in chunk:
-                obs, _ = env.reset_to_state(state)
-                img = env.render()
-                imgs.append(img)
-
-            # visualized selected states to augment
-            imgs = np.array(imgs)
-
-            # import ipdb
-
-            # ipdb.set_trace()
-
-            # img, trajectory, metric, density if available
-            n_plots_p_img = self.config.top_k * 2 + 1
-            if self.config.reweight_with_density:
-                n_plots_p_img += 1
-
-            fig, axs = plt.subplots(
-                num_rows_per_fig,
-                n_plots_p_img,
-                figsize=(4 * n_plots_p_img, 3 * num_rows_per_fig),
-            )
-            axs_flat = axs.flatten()
-
-            min_x, max_x = np.min(self.obss[:, 0]), np.max(self.obss[:, 0])
-            min_y, max_y = np.min(self.obss[:, 1]), np.max(self.obss[:, 1])
-
-            # import ipdb
-
-            # ipdb.set_trace()
-            count = num_rows_per_fig * self.config.top_k
-
-            for indx, row in enumerate(range(num_rows_per_fig)):
-                # show the top k states
-                for i in range(self.config.top_k):
-                    ax = axs_flat[row * n_plots_p_img + i]
-                    ax.axis("off")
-                    ax.imshow(imgs[indx * self.config.top_k + i])
-
-                ax1 = axs_flat[row * n_plots_p_img + self.config.top_k]
-
-                # plot the trajectory and use metric as color
-                traj_indx = selected_state_traj_indx_chunk[chunk_indx][
-                    indx * self.config.top_k
-                ]
-                start = self.start_indices[traj_indx]
-                end = self.start_indices[traj_indx + 1]
-                traj = self.obss[start:end]
-
-                metric_ = self.metric[start:end]
-                reweighted_metric_ = np.array(self.reweighted_metric[start:end])
-
-                ax1.set_xlim(min_x, max_x)
-                ax1.set_ylim(min_y, max_y)
-
-                # plot trajectory
-                ax1.scatter(
-                    traj[:, 0],
-                    traj[:, 1],
-                    c=np.array(metric_),
-                    alpha=0.5,
-                    cmap="viridis",
-                    s=100,
-                )
-
-                # plot selected states
-                for i in range(self.config.top_k):
-                    ax1.scatter(
-                        chunk[indx * self.config.top_k + i, 0],
-                        chunk[indx * self.config.top_k + i, 1],
-                        c="r",
-                        s=150,
-                    )
-
-                # plot goal
-                ax1.scatter(traj[0, 4], traj[0, 5], marker="x", c="g", s=150)
-
-                for i in range(self.config.top_k):
-                    ax2 = axs_flat[row * n_plots_p_img + self.config.top_k + 1 + i]
-                    # plot the metric and reweighted metric
-                    if self.config.reweight_with_density:
-                        ax2.plot(metric_, label="metric", color="b")
-                        ax2.plot(
-                            reweighted_metric_, label="reweighted metric", color="r"
-                        )
-
-                        # get top i-th reweighted metric
-                        top_i = np.argpartition(reweighted_metric_, -(i + 1))[
-                            -(i + 1) :
-                        ][0]
-
-                        # import ipdb
-
-                        # ipdb.set_trace()
-                        ax2.axvline(
-                            x=top_i,
-                            color="r",
-                            linestyle="--",
-                            linewidth=3,
-                        )
-                    else:
-                        ax2.plot(metric_, label="metric")
-
-                    # ax2.legend()
-                    top_i = np.argpartition(metric_, -(i + 1))[-(i + 1) :][0]
-                    ax2.axvline(
-                        x=top_i,
-                        color="b",
-                        linestyle="--",
-                        linewidth=3,
-                    )
-
-                if self.config.reweight_with_density:
-                    ax3 = axs_flat[row * n_plots_p_img + self.config.top_k * 2 + 1]
-                    # plot density metric
-                    densities = self.density_estimates[start:end]
-                    densities = postprocess_density(densities, self.config.lamb)
-                    ax3.plot(densities, label="density", color="g")
-
-            col_names = (
-                ["Image"] * self.config.top_k
-                + ["Trajectory"]
-                + ["Metric"] * self.config.top_k
-                + ["Density"]
-            )
-            for ax, col in zip(axs[0], col_names):
-                ax.set_title(col)
-
-            plt.subplots_adjust(wspace=0.1, hspace=0.1)
-
-            # write to wandb_run
-            if self.wandb_run:
-                # save as image instead of plotly interactive figure
-                buf = io.BytesIO()
-                plt.savefig(buf, format="png", dpi=100)
-                buf.seek(0)
-                self.wandb_run.log({f"selected_states": wandb.Image(Image.open(buf))})
-
-            # save figure
-            plt.savefig(f"selected_states_{chunk_indx}.png")
-
-    def visualize_selected_states_global(self, selected_indices, env=None):
+    def visualize_selected_states(self, selected_indices, env=None):
         logging.info("visualizing selected states")
 
         imgs = []
@@ -532,12 +401,15 @@ class QueryStateSelector:
 
         # visualized selected states to augment
         imgs = np.array(imgs)
+
+        logging.info(f"visualizing {imgs.shape[0]} images")
         n = 4
         num_imgs = n**2
-        imgs_chunked = np.array_split(imgs, imgs.shape[0] // num_imgs)
-        metrics_chunked = np.array_split(metrics, metrics.shape[0] // num_imgs)
+        imgs_chunked = np.array_split(imgs, max(imgs.shape[0] // num_imgs, 1))
+        metrics_chunked = np.array_split(metrics, max(metrics.shape[0] // num_imgs, 1))
 
         augment_data_dir = create_aug_data_dir(self.config)
+        logging.info(f"augment data dir: {augment_data_dir}")
         vis_dir = (
             Path(self.config.data_dir)
             / "augment_datasets"
@@ -553,7 +425,8 @@ class QueryStateSelector:
             fig, axs = plt.subplots(n, n, figsize=(20, 20))
             axs_flat = axs.flatten()
 
-            for indx, ax in enumerate(axs_flat):
+            for indx, img in enumerate(chunk):
+                ax = axs_flat[indx]
                 ax.axis("off")
                 ax.imshow(chunk[indx])
 
@@ -639,11 +512,41 @@ class QueryStateSelector:
         return selected_indices_traj, selected_indices_global, selected_state_traj_indx
 
 
-def run_augmentation(config, dataset, infos, wandb_run=None):
+def run_augmentation(config, wandb_run=None):
     config = ConfigDict(config)
 
-    # update the model ckpt based on config
-    config.model_ckpt = f"nt-{config.num_trajs}_s-{config.seed}"
+    # load model config from pretrained heuristic model
+    model_config_path = (
+        Path(config.root_dir)
+        / "ray_results"
+        / config.exp_name
+        / config.model_ckpt
+        / "params.json"
+    )
+    with open(model_config_path, "r") as f:
+        model_cfg = json.load(f)
+        model_cfg = ConfigDict(model_cfg)
+
+    logging.info(f"loading model config from: {model_config_path}")
+
+    # set random seed
+    np.random.seed(model_cfg.seed)
+    torch.manual_seed(model_cfg.seed)
+
+    # STEP 1: Load base dataset and pass it into each run
+    logging.info("Loading dataset")
+    if config.env == "MAZE" or config.env == "MW":
+        if config.load_randomly_sampled_states:
+            dataset_f = Path(config.data_dir) / config.data_file
+            with open(dataset_f, "rb") as f:
+                dataset = pickle.load(f)
+            logging.info(f"number of random states: {len(dataset)}")
+            infos = None
+            config.selection = "global"
+        else:
+            dataset = load_maze_dataset(model_cfg)
+    else:
+        raise NotImplementedError
 
     env = make_env(
         config.env,
@@ -670,12 +573,12 @@ def run_augmentation(config, dataset, infos, wandb_run=None):
         )
 
     logging.info(f"number of selected states: {len(selected_indices_global)}")
+    logging.info(f"selected indices: {selected_indices_global}")
+    logging.info(f"selected indices traj: {selected_indices_traj}")
+    logging.info(f"selected indices traj indx: {selected_state_traj_indx}")
 
     if config.visualize:
-        # selector.visualize_selected_states(
-        #     selected_indices_global, selected_state_traj_indx, env
-        # )
-        selector.visualize_selected_states_global(selected_indices_global, env)
+        selector.visualize_selected_states(selected_indices_global, env)
 
     # STEP 3: Augment selected states with a few steps of expert actions
     # Perturb states a little bit
@@ -694,10 +597,11 @@ def run_augmentation(config, dataset, infos, wandb_run=None):
     rollouts = []
 
     selected_states = selector.obss[selected_indices_global]
+    selected_infos = None
     if not config.load_randomly_sampled_states:
-        selected_infos = [infos[ind] for ind in selected_indices_global]
-    else:
-        selected_infos = None
+        if selector.infos is not None:
+            selected_infos = [selector.infos[ind] for ind in selected_indices_global]
+
     # import ipdb
 
     # ipdb.set_trace()
@@ -829,6 +733,7 @@ def run_augmentation(config, dataset, infos, wandb_run=None):
             fps=10,
         )
 
+    # finish and close the environments
     env.close()
 
 
@@ -842,37 +747,6 @@ param_space = {
 
 def main(_):
     config = _CONFIG.value
-
-    # set random seed
-    np.random.seed(0)
-    torch.manual_seed(0)
-
-    # STEP 1: Load base dataset and pass it into each run
-    logging.info("Loading dataset")
-    if config.env == "MAZE" or config.env == "MW":
-        if config.load_randomly_sampled_states:
-            dataset_f = Path(config.data_dir) / config.data_file
-            with open(dataset_f, "rb") as f:
-                dataset = pickle.load(f)
-            logging.info(f"number of random states: {len(dataset)}")
-            infos = None
-            config.selection = "global"
-        else:
-            dataset, train_loader, test_loader, obs_dim, action_dim, infos = (
-                load_pkl_dataset(
-                    config.data_dir,
-                    config.data_file,
-                    batch_size=1,
-                    num_trajs=10000,  # use all
-                    train_perc=1.0,
-                    env=config.env,
-                )
-            )
-            obs_dim = obs_dim
-            action_dim = action_dim
-            logging.info(f"obs_dim: {obs_dim} action_dim: {action_dim}")
-    else:
-        raise NotImplementedError
 
     if not config.smoke_test:
         # log the visualizations to wandb
@@ -901,9 +775,7 @@ def main(_):
         )
         config.update(param_space)
         tuner = tune.Tuner(
-            tune.with_parameters(
-                run_augmentation_fn, dataset=dataset, infos=infos, wandb_run=wandb_run
-            ),
+            tune.with_parameters(run_augmentation_fn, wandb_run=wandb_run),
             param_space=config,
             run_config=run_config,
             # tune_config=tune.TuneConfig(
@@ -914,7 +786,7 @@ def main(_):
         results = tuner.fit()
         print(results)
     else:
-        run_augmentation(config, dataset, infos)
+        run_augmentation(config)
 
 
 if __name__ == "__main__":
